@@ -27,9 +27,9 @@ part of the security boundary.
 
 | Component | Version / purpose |
 | --- | --- |
-| Android application | 0.12.0, API 28+, protobuf wire format (protocol v2), readable long commands (formatted/exact view, collapse and expand, explicit Reject), desk reader mode, code enrollment (KDE Connect, guided destination setup, Downloads on Android 9–10), Settings and Paired computers screens, remote approvals over ntfy, non-debuggable release |
-| Host CLI and native/Python authority | 0.12.0 with the protobuf wire format (`proto/navi.proto`), commands up to 10240 characters (build-time `MAX_COMMAND`), an automatic route per request (direct local network, then KDE Connect messages, then ntfy), code enrollment over KDE Connect, device selection by name, remote approvals over ntfy when KDE Connect can't see the phone, and a warning when kdesu is not Navi-enabled |
-| System Settings page | `kcm_navi_auth` 0.10.0: enroll, status, remote approvals and test (automatic, KDE Connect messages, direct network or ntfy) per KDE Connect device |
+| Android application | 0.13.1, API 28+, protobuf wire format (protocol v2) with approve-only requests for sudo, SDDM and the lock screen, readable long commands (formatted/exact view, collapse and expand, explicit Reject), desk reader mode, code enrollment (KDE Connect, guided destination setup, Downloads on Android 9–10), Settings and Paired computers screens, remote approvals over ntfy, non-debuggable release |
+| Host CLI and native/Python authority | 0.13.1 with the protobuf wire format (`proto/navi.proto`), optional sudo, SDDM login and lock-screen approval (build-time opt-in), commands up to 10240 characters (build-time `MAX_COMMAND`), an automatic route per request (direct local network, then KDE Connect messages, then ntfy), code enrollment over KDE Connect, device selection by name, remote approvals over ntfy when KDE Connect can't see the phone, and a warning when kdesu is not Navi-enabled |
+| System Settings page | `kcm_navi_auth` 0.13.0: enroll, status, remote approvals, the optional sudo/login/lock-screen switches and test (automatic, KDE Connect messages, direct network or ntfy) per KDE Connect device |
 | KDE patch and Gentoo packages | kdesu-gui 6.8.2-r1 against kde-cli-tools 6.8.2 (6.7.2-r3 for Plasma 6.7.2) |
 | Direct Wi-Fi transport | Pinned TLS 1.3; restricted TLS 1.2 on Android 9; TCP 39841 |
 | Optional KDE Connect transport | File sharing on Android 10+, or paired-device IP lookup for direct Wi-Fi |
@@ -53,8 +53,12 @@ verified on a physical phone.**
 
 The new dedicated KDE Connect plugin was a separate unfinished experiment. It is
 not needed for this release and is not included as a working feature. Bluetooth
-delivery, PAM, sudo, login, screen unlock and general PolicyKit integration are
-not implemented. Installing this does not reroute those authentication systems.
+delivery, login, screen unlock and general PAM/PolicyKit integration are not
+implemented. Optional, build-time-enabled helpers (`USE=sudo`,
+`USE=login`) let the phone approve `sudo` in local Konsole and Kitty terminals,
+the SDDM login screen and the Plasma lock screen, each switched on in System
+Settings; see [INSTALL](docs/INSTALL.md#8-phone-approval-for-sudo-login-and-the-lock-screen-optional).
+They are new and not yet verified on hardware. Nothing else is rerouted.
 
 ## Desk reader mode and multiple phones
 

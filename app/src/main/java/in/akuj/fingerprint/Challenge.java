@@ -50,6 +50,7 @@ final class Challenge {
         validateText(context.getTargetUser(), 64, false);
         validateText(context.getSource(), 64, false);
         validateText(context.getIconName(), 128, true);
+        validateText(context.getTty(), 64, true);
         if (!context.getIconSha256().isEmpty()) Wire.exact(context.getIconSha256(), 32, "requester icon hash");
         if (!context.hasRequestingUid()) throw new IllegalArgumentException("Invalid requesting account.");
         if (context.getMode() == Mode.UNRECOGNIZED) throw new IllegalArgumentException("Unknown request mode. " + Wire.UPDATE_HINT);
@@ -68,6 +69,8 @@ final class Challenge {
         } else if (payload.hasExecution()) {
             throw new IllegalArgumentException("Only an execution request may carry an execution.");
         }
+        if (approvalOnly() && !AUTHENTICATE.equals(kind))
+            throw new IllegalArgumentException("Only an authentication request may be approve-only.");
         long now = System.currentTimeMillis();
         long issued = payload.getIssuedAtMs();
         long expires = payload.getExpiresAtMs();
@@ -106,6 +109,8 @@ final class Challenge {
     boolean expired() { return SystemClock.elapsedRealtime() >= deadline; }
     boolean notificationOnly() { return context.getMode() == Mode.MODE_NOTIFICATION_ONLY; }
     boolean execution() { return context.getMode() == Mode.MODE_EXECUTE; }
+    /** sudo, SDDM or the lock screen: the computer runs nothing; the waiting caller continues. */
+    boolean approvalOnly() { return context.getMode() == Mode.MODE_APPROVE; }
     boolean remoteSetup() { return REMOTE_SETUP.equals(kind); }
     /** Hex SHA-256 of the requester icon, or "" when the request carries none. */
     String iconSha256() { return context.getIconSha256().isEmpty() ? "" : Wire.hex(context.getIconSha256()); }

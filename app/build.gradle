@@ -10,8 +10,8 @@ android {
         applicationId 'in.akuj.fingerprint'
         minSdk 28
         targetSdk 34
-        versionCode 20
-        versionName '0.12.0'
+        versionCode 22
+        versionName '0.13.1'
     }
     buildTypes {
         release { debuggable false }

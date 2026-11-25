@@ -108,6 +108,19 @@ refused("a short request ID", lambda: host.request_message(pb.KIND_AUTHENTICATE,
 enroll = host.request_message(pb.KIND_ENROLL, secrets.token_bytes(16), machine_id, leaf_der, "Approve this phone",
                               now, now + 120000, dict(context, mode=""))
 _, enroll_envelope = host.request_envelope(machine_key, enroll, root, leaf_der)
+
+# sudo, SDDM and the lock screen: approve-only, nothing for the computer to run.
+approve_context = dict(context, application="sudo in Konsole", action_id="sudo", source="sudo", mode="approve",
+                       command="emerge --ask --update @world", desktop_request_id="", requester_executable="",
+                       tty="/dev/pts/31")
+approve_only = host.request_message(pb.KIND_AUTHENTICATE, secrets.token_bytes(16), machine_id, leaf_der,
+                                    "Run as root with sudo", now, now + 120000, approve_context)
+_, opened_approve = host.open_signed(host.request_envelope(machine_key, approve_only)[1].signed, root.public_key(), "request")
+check("an approve-only request is MODE_APPROVE without an execution",
+      opened_approve.context.mode == pb.MODE_APPROVE and not opened_approve.HasField("execution"))
+check("the sudo terminal round-trips", opened_approve.context.tty == "/dev/pts/31")
+refused("a terminal that is not a pseudo-terminal", lambda: host.context_message(dict(approve_context, tty="/dev/tty1")))
+refused("an unknown request mode", lambda: host.context_message(dict(context, mode="sudo")))
 check("enrollment carries both certificates",
       bytes(enroll_envelope.machine_certificate) == der(root) and bytes(enroll_envelope.phone_certificate) == leaf_der)
 

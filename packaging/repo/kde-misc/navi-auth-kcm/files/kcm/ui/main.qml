@@ -11,6 +11,12 @@ KCM.ScrollViewKCM {
     implicitWidth: Kirigami.Units.gridUnit * 36
     implicitHeight: Kirigami.Units.gridUnit * 28
 
+    function pamLabel(service) {
+        return service === "sudo" ? i18n("sudo in local Konsole and Kitty terminals")
+             : service === "sddm" ? i18n("SDDM login screen (Enter with an empty password)")
+             : i18n("Plasma lock screen (Enter with an empty password)")
+    }
+
     function fingerprint(id) {
         return id.length >= 12 ? id.substring(0, 4) + " " + id.substring(4, 8) + " " + id.substring(8, 12) : id
     }
@@ -82,6 +88,64 @@ KCM.ScrollViewKCM {
             visible: kcm.authorityProblem.length > 0
             type: Kirigami.MessageType.Information
             text: i18n("Administrator prompt status is unavailable: %1", kcm.authorityProblem)
+        }
+        // Optional phone approvals for PAM services (sudo, SDDM login, lock screen), present only when built in.
+        Repeater {
+            model: ["sudo", "sddm", "kde"].filter(service => kcm.pamApproval[service] !== undefined)
+            delegate: ColumnLayout {
+                id: pamRow
+                required property string modelData
+                readonly property string service: modelData
+                readonly property string state: kcm.pamApproval[service] ?? ""
+                readonly property bool lost: kcm.pamApprovalLost.indexOf(service) >= 0
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
+                Kirigami.InlineMessage {
+                    Layout.fillWidth: true
+                    visible: pamRow.state === "misplaced" || pamRow.state === "outdated" || pamRow.lost
+                    type: Kirigami.MessageType.Warning
+                    text: pamRow.lost
+                        ? i18n("Phone approval for %1 was turned off outside System Settings, probably by a package update that replaced /etc/pam.d/%2. Turn it on again to restore it.", root.pamLabel(pamRow.service), pamRow.service)
+                        : i18n("The phone approval line in /etc/pam.d/%1 needs repair (it is below the password rule or not the expected line).", pamRow.service)
+                    actions: Kirigami.Action {
+                        text: i18nc("@action:button", "Repair")
+                        icon.name: "tools-wizard"
+                        enabled: !kcm.busy && kcm.canChangePamApproval
+                        onTriggered: kcm.setPamApproval(pamRow.service, true)
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+                    QQC2.Switch {
+                        text: i18nc("@option:check", "Approve from the phone: %1", root.pamLabel(pamRow.service))
+                        checked: pamRow.state === "enabled"
+                        enabled: !kcm.busy && kcm.canChangePamApproval && pamRow.state !== "unrecognized"
+                                 && (checked || kcm.authorityConfigured)
+                        onToggled: {
+                            const wanted = checked
+                            checked = Qt.binding(() => pamRow.state === "enabled") // reflect the real file, not the click
+                            kcm.setPamApproval(pamRow.service, wanted)
+                        }
+                        QQC2.ToolTip.text: !kcm.authorityConfigured && !checked
+                            ? i18n("Turn on Administrator prompts for a phone first; this uses the same protected phone approval.")
+                            : pamRow.service === "sudo"
+                            ? i18n("Adds one line to /etc/pam.d/sudo (administrator password required). sudo then asks the phone first; declining, a timeout or Ctrl-C falls back to your password. SSH sessions, other terminals, su, pkexec and other system prompts are not affected.")
+                            : pamRow.service === "sddm"
+                            ? i18n("Adds one line to /etc/pam.d/sddm (administrator password required). At the login screen, press Enter with an empty password to approve on the phone; typing the password works as before. KDE Connect is not running before you log in, so this needs Remote Approvals (ntfy) for the phone. KWallet will not open automatically after a phone login.")
+                            : i18n("Adds one line to /etc/pam.d/kde (administrator password required). On the lock screen, press Enter with an empty password to approve on the phone; typing the password works as before. Console logins, SSH and su keep using passwords.")
+                        QQC2.ToolTip.visible: hovered
+                        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    }
+                    QQC2.BusyIndicator {
+                        visible: kcm.busy && (kcm.task === "pam-enable" || kcm.task === "pam-disable")
+                        running: visible
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                        Layout.preferredWidth: Layout.preferredHeight
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+            }
         }
         QQC2.Label {
             Layout.fillWidth: true
@@ -275,7 +339,7 @@ KCM.ScrollViewKCM {
                     // With remote approvals a phone KDE Connect can't see is still reachable over ntfy.
                     enabled: !kcm.busy && (card.usable || card.remote.length > 0)
                     onClicked: testMenu.popup(this, 0, height)
-                    QQC2.ToolTip.text: i18n("Ask the phone for a fingerprint approval without running anything. Automatic uses the same order as administrator prompts: Navi's direct local-network connection (found through KDE Connect, port 39841), then KDE Connect messages, then ntfy when KDE Connect can't reach the phone. The other entries test one route each.")
+                    QQC2.ToolTip.text: i18n("Ask the phone for a fingerprint approval without running anything. Automatic uses the same order as administrator prompts, sudo and the lock screen: Navi's direct local-network connection (found through KDE Connect, port 39841), then KDE Connect messages, then ntfy when KDE Connect can't reach the phone. The other entries test one route each.")
                     QQC2.ToolTip.visible: hovered
                     QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
                     QQC2.Menu {

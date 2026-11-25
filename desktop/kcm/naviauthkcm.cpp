@@ -12,6 +12,8 @@
 #include <QJsonObject>
 #include <QFileInfo>
 #include <QProcessEnvironment>
+#include <QSettings>
+#include <QVariantMap>
 #include <QStandardPaths>
 
 #include <algorithm>
@@ -52,6 +54,33 @@ QString pkexec()
 QString polkitConfigure()
 {
     return environmentOr("NAVI_AUTH_POLKIT_CONFIGURE", NAVI_AUTH_POLKIT_CONFIGURE_DEFAULT);
+}
+
+QString pamSwitch()
+{
+    return environmentOr("NAVI_AUTH_PAM_SWITCH", NAVI_AUTH_PAM_SWITCH_DEFAULT);
+}
+
+QString pamServiceLabel(const QString &service)
+{
+    if (service == QLatin1String("sudo")) {
+        return i18n("sudo in local Konsole and Kitty terminals");
+    }
+    if (service == QLatin1String("sddm")) {
+        return i18n("the SDDM login screen");
+    }
+    return i18n("the Plasma lock screen");
+}
+
+bool pkexecTask(const QString &task)
+{
+    return task == QLatin1String("authority-enable") || task == QLatin1String("pam-enable") || task == QLatin1String("pam-disable");
+}
+
+QSettings uiState()
+{
+    // Remembers only which approvals were turned on here, to notice when a package update removes one.
+    return QSettings(QStringLiteral("navi-auth"), QStringLiteral("kcm"));
 }
 
 QString quoted(const QString &value)
@@ -207,7 +236,7 @@ void NaviAuthKcm::sendTest(const QString &deviceId, const QString &transport)
     // pinned TLS connection, the same route kdesu uses with the LAN transport. Remote: ntfy only.
     m_testTransport = transport;
     const bool network = transport == QLatin1String("network");
-    // Automatic: the same order administrator prompts use (local network, KDE Connect messages, ntfy).
+    // Automatic: the same order kdesu, sudo and the lock screen use (local network, KDE Connect messages, ntfy).
     const QString routeOption = transport == QLatin1String("auto") ? QStringLiteral("--device")
         : network ? QStringLiteral("--kdeconnect-device") : QStringLiteral("--kdeconnect-messages");
     QStringList arguments{QStringLiteral("authenticate"), routeOption,
@@ -289,6 +318,39 @@ void NaviAuthKcm::disableAdministratorPrompts(const QString &deviceId)
     if (m_devices->find(deviceId)) {
         startTask(QStringLiteral("authority-revoke"), deviceId, {QStringLiteral("authority-revoke"), deviceId});
     }
+}
+
+QVariantMap NaviAuthKcm::pamApproval() const
+{
+    return m_authority.value(QStringLiteral("pam_approval")).toObject().toVariantMap();
+}
+
+bool NaviAuthKcm::canChangePamApproval() const
+{
+    return !QStandardPaths::findExecutable(pkexec()).isEmpty() && QFileInfo(pamSwitch()).isExecutable();
+}
+
+QStringList NaviAuthKcm::pamApprovalLost() const
+{
+    QStringList lost;
+    const QVariantMap states = pamApproval();
+    QSettings state = uiState();
+    for (auto it = states.cbegin(); it != states.cend(); ++it) {
+        if (it.value().toString() == QLatin1String("disabled") && state.value(QStringLiteral("wanted/") + it.key()).toBool()) {
+            lost.append(it.key());
+        }
+    }
+    return lost;
+}
+
+void NaviAuthKcm::setPamApproval(const QString &service, bool enabled)
+{
+    if (!pamApproval().contains(service) || !canChangePamApproval()) {
+        return;
+    }
+    m_pamService = service;
+    startProcess(enabled ? QStringLiteral("pam-enable") : QStringLiteral("pam-disable"), QString(), pkexec(),
+                 {pamSwitch(), enabled ? QStringLiteral("enable") : QStringLiteral("disable"), service});
 }
 
 bool NaviAuthKcm::authorityAvailable() const
@@ -445,13 +507,14 @@ void NaviAuthKcm::taskExited(int exitCode, QProcess::ExitStatus status)
     }
     m_expiryTimer.stop();
     const QString task = m_task;
-    if (task == QLatin1String("authority-enable") && status == QProcess::NormalExit) {
+    if (pkexecTask(task) && status == QProcess::NormalExit) {
         // pkexec: 126 = authentication dialog dismissed, 127 = not authorized; otherwise the configurator's exit.
         m_taskDone = exitCode == 0;
         if (exitCode == 126) {
             exitCode = 130; // treated as a quiet cancel below
         } else if (exitCode == 127) {
-            m_taskError = i18n("Not authorized to change administrator prompts.");
+            m_taskError = task == QLatin1String("authority-enable") ? i18n("Not authorized to change administrator prompts.")
+                                                                     : i18n("Not authorized to change how %1 authenticates.", pamServiceLabel(m_pamService));
         } else if (exitCode != 0) {
             const QStringList lines = standardError.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
             m_taskError = lines.isEmpty() ? QString() : lines.last();
@@ -486,6 +549,15 @@ void NaviAuthKcm::taskExited(int exitCode, QProcess::ExitStatus status)
                 : i18n("%1 can no longer approve requests from this account.", m_taskDeviceName);
         } else if (task == QLatin1String("authority-revoke")) {
             result = i18n("%1 can no longer approve administrator prompts.", m_taskDeviceName);
+        } else if (task == QLatin1String("pam-enable")) {
+            result = m_pamService == QLatin1String("sudo")
+                ? i18n("sudo in local Konsole and Kitty terminals now asks your phone first; the password stays as the fallback.")
+                : i18n("On %1, press Enter with an empty password to approve on your phone; typing the password works as before.",
+                       pamServiceLabel(m_pamService));
+            uiState().setValue(QStringLiteral("wanted/") + m_pamService, true);
+        } else if (task == QLatin1String("pam-disable")) {
+            result = i18n("%1 asks for your password again, as before.", pamServiceLabel(m_pamService));
+            uiState().setValue(QStringLiteral("wanted/") + m_pamService, false);
         } else if (task == QLatin1String("authority-enable")) {
             result = i18n("%1 can now approve administrator prompts for this account.", m_taskDeviceName);
         } else {

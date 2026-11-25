@@ -115,6 +115,7 @@ enum Mode {
   MODE_UNSPECIFIED = 0;
   MODE_EXECUTE = 1;
   MODE_NOTIFICATION_ONLY = 2;
+  MODE_APPROVE = 3;  // approval only, no Execution: the caller (sudo, SDDM, lock screen) continues itself
 }
 
 // Display context. Fields every kdesu request carries use 1-15.
@@ -133,7 +134,7 @@ message Context {
   bytes desktop_request_id = 12; // 16-byte UUID of the kdesu dialog
   uint32 requester_pid = 13;
   string requester_executable = 14;
-  // 15 is kept for a per-request field such as the sudo terminal.
+  string tty = 15;               // sudo only: the requesting terminal (/dev/pts/N)
   bool command_hidden = 16;
 }
 

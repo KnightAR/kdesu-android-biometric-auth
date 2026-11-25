@@ -12,6 +12,7 @@ import pwd
 import re
 import secrets
 import signal
+import socket
 import sqlite3
 import stat
 import struct
@@ -31,16 +32,19 @@ RUNTIME = Path("/run/navi-auth")
 CONFIG = Path("/etc/navi-auth/config.json")
 MAX_MESSAGE = 65536
 MAX_IMPLEMENTATION = 1048576  # Installed program files; configuration stays limited to MAX_MESSAGE.
+# PAM helpers (sudo, SDDM) share the user's terminal or screen as stderr; they log to the journal only.
+AUDIT_STDERR = True
 
 
 def audit(message):
     # Closing or filling the caller's diagnostic pipe cannot interrupt authority.
-    try:
-        os.set_blocking(2, False)
-        data = (time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n").encode("utf-8", errors="replace")
-        os.write(2, data[:2048])
-    except OSError:
-        pass
+    if AUDIT_STDERR:
+        try:
+            os.set_blocking(2, False)
+            data = (time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n").encode("utf-8", errors="replace")
+            os.write(2, data[:2048])
+        except OSError:
+            pass
     # kdesu discards the helper's stderr, so also record decisions in the system log
     # (journalctl -t navi-auth). Messages carry IDs and routes, never commands or keys.
     try:
@@ -70,12 +74,15 @@ def trusted_file(path, private=False, limit=MAX_MESSAGE):
 
 
 IMPLEMENTATION = ("rootauth.py", "host.py", "navi_pb2.py", "kdeconnect_transport.py", "ntfy_transport.py")
+# Installed only when built with sudo approval (make ENABLE_SUDO=yes / USE=sudo).
+OPTIONAL_IMPLEMENTATION = ("sudo_approve.py", "login_approve.py", "pam_common.py", "pam_switch.py")
 
 
 def check_implementation(directory=None):
     """The installed program files must be root-owned and not writable by others."""
     directory = directory or Path(__file__).resolve().parent
-    for name in IMPLEMENTATION:
+    optional = tuple(name for name in OPTIONAL_IMPLEMENTATION if (directory / name).exists())
+    for name in IMPLEMENTATION + optional:
         source = directory / name
         trusted_file(source, limit=MAX_IMPLEMENTATION)
         info = source.parent.stat()
@@ -97,6 +104,28 @@ def plain(value, limit, field, empty=False, allow_layout=False):
     if not crypto.check_layout_text(value, limit, allow_layout) or (not value and not empty):
         raise ValueError(f"Invalid {field}")
     return value
+
+
+class Rejected(PermissionError):
+    """The phone owner declined the request."""
+
+
+class Unanswered(TimeoutError):
+    """The request reached a phone but was not answered before it expired."""
+
+
+class Undelivered(ConnectionError):
+    """No phone could be reached."""
+
+
+def no_approval(attempts):
+    """Why no phone approved: rejected, unanswered (timed out) or undelivered, in that order of precedence."""
+    errors = [attempt.error for attempt in attempts if attempt.error]
+    if any("Phone declined" in error for error in errors):
+        return Rejected("Rejected on the phone")
+    if any(attempt.delivered and not attempt.error for attempt in attempts):
+        return Unanswered("No answer from the phone before the request expired")
+    return Undelivered("Phone unreachable: " + (errors[0] if errors else "no enrolled phone could be reached"))
 
 
 def validate_start(event, peer_uid, account):
@@ -139,9 +168,23 @@ def validate_start(event, peer_uid, account):
     context.update(action_id="org.kde.kdesu.run", command_hidden=False, requesting_user=account.pw_name,
                    requesting_uid=peer_uid, target_user="root", source="kdesu", requester_pid=requester_pid,
                    icon_png_base64=encoded, mode="execute", desktop_request_id=event["request_id"])
-    environment = event["environment"]
-    if not isinstance(environment, dict) or set(environment) - {
-            "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XAUTHORITY"}:
+    environment = validate_environment(event["environment"], peer_uid)
+    # Environment that can change executable/library/config lookup is never inherited.
+    execution_env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "USER": "root", "LOGNAME": "root",
+                     "LANG": "C.UTF-8", "KDESU_USER": account.pw_name}
+    execution_env.update(environment)
+    cwd = plain(event["cwd"], 4096, "working directory")
+    if not cwd.startswith("/") or not Path(cwd).is_dir():
+        raise ValueError("Working directory must be an existing absolute directory")
+    return context, execution_env, cwd
+
+
+DESKTOP_ENVIRONMENT = {"DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XAUTHORITY"}
+
+
+def validate_environment(environment, peer_uid):
+    """Desktop session variables, accepted only when they point at the account's own runtime files."""
+    if not isinstance(environment, dict) or set(environment) - DESKTOP_ENVIRONMENT:
         raise ValueError("Unsupported execution environment")
     runtime = f"/run/user/{peer_uid}"
     for name, value in environment.items():
@@ -170,14 +213,7 @@ def validate_start(event, peer_uid, account):
         info = Path(runtime).lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != peer_uid or info.st_mode & 0o022:
             raise ValueError("Unsafe desktop runtime directory")
-    # Environment that can change executable/library/config lookup is never inherited.
-    execution_env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "USER": "root", "LOGNAME": "root",
-                     "LANG": "C.UTF-8", "KDESU_USER": account.pw_name}
-    execution_env.update(environment)
-    cwd = plain(event["cwd"], 4096, "working directory")
-    if not cwd.startswith("/") or not Path(cwd).is_dir():
-        raise ValueError("Working directory must be an existing absolute directory")
-    return context, execution_env, cwd
+    return dict(environment)
 
 
 async def read_event(reader, deadline):
@@ -391,7 +427,7 @@ class PhoneAttempt:
         if name != "receipt":
             await asyncio.to_thread(self.phone.notify, self.request_id, canceled)
 
-    async def run(self, desktop_id, context, execution, environment, deadline):
+    async def run(self, desktop_id, context, execution, environment, deadline, operation="Run this command as root"):
         owner = self.authority
         try:
             audit(f"phone-attempt desktop={desktop_id} phone={self.phone_key_id}")
@@ -410,7 +446,7 @@ class PhoneAttempt:
             # Paired requests carry no certificates: Navi uses the ones stored at pairing,
             # named here by machine_id and certificate_sha256.
             request = crypto.request_message(crypto.pb().KIND_AUTHENTICATE, request_bytes, owner.machine_id, leaf_der,
-                "Run this command as root", now, now + int((deadline - time.monotonic()) * 1000), context,
+                operation, now, now + int((deadline - time.monotonic()) * 1000), context,
                 execution=execution,
                 # Only a request that travels through KDE Connect binds Navi's reply to that device.
                 transport=getattr(self.phone, "transport", None), remote=self.remote is not None)
@@ -497,6 +533,65 @@ class Authority:
         self.db.execute("UPDATE requests SET status='canceled' WHERE status IN ('pending','ready')")
         self.db.commit()
 
+    async def approve_only(self, context, environment, deadline, operation, label, desktop_id=None):
+        """Phone approval without execution, for an opt-in PAM caller (sudo) that runs the command itself.
+
+        Same per-phone signed requests, first-approval-wins, revocation re-check and signed receipt as
+        handle(); the receipt's execution_pid stays 0 because nothing is launched here.
+        """
+        desktop_id = desktop_id or str(uuid.uuid4())
+        winner = None
+        approved = False
+        try:
+            pending = {}
+            for attempt in self.attempts:
+                attempt.task = asyncio.create_task(attempt.run(desktop_id, context, None, environment, deadline, operation))
+                pending[attempt.task] = attempt
+            while pending and winner is None:
+                done, _ = await asyncio.wait(set(pending), timeout=max(0.0, deadline - time.monotonic()),
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    break
+                for task in done:
+                    attempt = pending.pop(task)
+                    try:
+                        signature = task.result()
+                    except Exception:
+                        attempt.withdraw()
+                        continue
+                    if signature is not None:
+                        winner = attempt
+                        break
+            if winner is None:
+                raise no_approval(self.attempts)
+            for attempt in self.attempts:
+                if attempt is not winner:
+                    attempt.withdraw()
+            with commit_guard():
+                if crypto.digest(trusted_file(CONFIG, True)) != self.config_digest:
+                    raise ValueError("Phone approval was revoked or configuration changed")
+                with self.db:
+                    changed = self.db.execute("UPDATE requests SET status='consumed' WHERE id=? AND status='pending'",
+                                              (winner.request_id,)).rowcount
+                    if changed != 1:
+                        raise ValueError("Phone approval was already consumed")
+                approved = True
+            audit(f"{label}-approved request={winner.request_id} desktop={desktop_id} phone={winner.phone_key_id}")
+            signature = winner.task.result()
+            receipt = crypto.receipt_message(self.key, bytes.fromhex(winner.request_id), signature)
+            try:
+                await winner.deliver("receipt", receipt)
+            except Exception as error:
+                audit(f"{label}-receipt-delivery-failed request={winner.request_id}: {type(error).__name__}")
+            return winner
+        except (Exception, asyncio.CancelledError) as error:
+            outcome = {Rejected: "rejected", Unanswered: "timed-out", Undelivered: "unreachable"}.get(type(error), "failed")
+            audit(f"{label}-ended desktop={desktop_id} approved={approved} outcome={outcome} reason={type(error).__name__}: {error}")
+            raise
+        finally:
+            await asyncio.gather(*(attempt.finish(True) if attempt is winner and approved else attempt.withdraw()
+                                   for attempt in self.attempts), return_exceptions=True)
+
     async def handle(self, reader, writer, uid, first_event=None):
         desktop_id = None
         winner = None
@@ -543,7 +638,7 @@ class Authority:
                         winner = attempt
                         break
             if winner is None:
-                raise ConnectionError("No enrolled phone approved; devices may be offline or have declined")
+                raise no_approval(self.attempts)
             request_id, request = winner.request_id, winner.request
             # Only this winner can become ready. Other phone proofs are withdrawn
             # concurrently; a slow/offline device cannot delay the command.
@@ -670,6 +765,108 @@ class PipeWriter:
         pass
 
 
+UNLOCK_SECONDS = 60
+LOCK_GREETER = "/usr/libexec/kscreenlocker_greet"
+LOCK_WORKER = "/usr/libexec/kscreenlocker_worker"
+
+
+def _proc_record(pid, root="/proc"):
+    """(parent pid, real uid, exe) as root can read them, also for non-dumpable processes."""
+    with open(f"{root}/{pid}/stat", "rb") as stat_file:
+        data = stat_file.read(4096).decode(errors="replace")
+    ppid = int(data[data.rindex(")") + 2:].split()[1])
+    with open(f"{root}/{pid}/status", "rb") as status_file:
+        uid = next(int(line.split()[1]) for line in status_file.read(16384).decode(errors="replace").splitlines()
+                   if line.startswith("Uid:"))
+    try:
+        exe = os.readlink(f"{root}/{pid}/exe")
+    except OSError:
+        exe = ""
+    return ppid, uid, exe[:-len(" (deleted)")] if exe.endswith(" (deleted)") else exe
+
+
+def verify_lock_screen_caller(uid, caller=None, root="/proc"):
+    """The unlock request must come from the user's own Plasma lock screen.
+
+    authorize execs this process directly, so our parent is the pam_exec helper; its parent must be
+    kscreenlocker_worker started by kscreenlocker_greet (Plasma 6.8+), or kscreenlocker_greet itself,
+    all owned by uid and running root-owned binaries that only root can modify.
+    """
+    caller = os.getppid() if caller is None else caller
+
+    def binary_ok(path):
+        try:
+            info = os.stat(path)
+        except OSError:
+            return False
+        return info.st_uid == 0 and not info.st_mode & 0o022
+
+    helper_parent, helper_uid, _ = _proc_record(caller, root)
+    parent, parent_uid, parent_exe = _proc_record(helper_parent, root)
+    if helper_uid != uid or parent_uid != uid:
+        raise ValueError("The unlock request does not come from this user's lock screen")
+    if parent_exe == LOCK_WORKER and binary_ok(LOCK_WORKER):
+        _, greeter_uid, greeter_exe = _proc_record(parent, root)
+        if greeter_uid == uid and greeter_exe == LOCK_GREETER and binary_ok(LOCK_GREETER):
+            return
+    elif parent_exe == LOCK_GREETER and binary_ok(LOCK_GREETER):
+        return
+    raise ValueError("The unlock request does not come from the Plasma lock screen")
+
+
+async def approve_for_caller(uid, event, writer, loop):
+    """Phone approval to unlock the caller's own Plasma session (the lock screen runs PAM as the user).
+
+    Exists only when built with login approval (login_approve.py installed). The reply only says
+    whether the enrolled phone approved; it grants the caller nothing it could not already do.
+    Context and wording are built here, never taken from the caller.
+    """
+    request_id = event.get("request_id")
+    try:
+        if not Path(__file__).resolve().with_name("login_approve.py").exists():
+            raise ValueError("Phone approval for the lock screen is not installed")
+        if set(event) != {"protocol", "event", "request_id", "kind", "environment"} or event["kind"] != "unlock":
+            raise ValueError("Unexpected approval request")
+        verify_lock_screen_caller(uid)
+        with (STATE / "authority.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("Another phone request is in progress") from None
+            authority = Authority()
+            try:
+                if uid != authority.account.pw_uid:
+                    raise ValueError("Invoking account is not enrolled")
+                environment = validate_environment(event["environment"], uid)
+                if "DBUS_SESSION_BUS_ADDRESS" not in environment:
+                    # The lock screen is non-dumpable, so the unprivileged helper cannot read its environment.
+                    # The caller chain is verified above; use the session's standard bus, which
+                    # validate_environment() accepts only if the socket and runtime belong to uid.
+                    runtime = Path(f"/run/user/{uid}")
+                    if (runtime / "bus").exists():
+                        environment = validate_environment(
+                            dict(environment, DBUS_SESSION_BUS_ADDRESS=f"unix:path={runtime / 'bus'}",
+                                 XDG_RUNTIME_DIR=str(runtime)), uid)
+                name = authority.account.pw_name
+                context = {"application": "Plasma lock screen", "action_id": "unlock-session", "command": "",
+                           "command_hidden": False, "requesting_user": name, "requesting_uid": uid, "target_user": name,
+                           "source": "kscreenlocker", "mode": "approve", "icon_name": "system-lock-screen",
+                           "icon_png_base64": ""}
+                audit(f"unlock-start user={name}")
+                task = asyncio.create_task(authority.approve_only(
+                    context, environment, time.monotonic() + UNLOCK_SECONDS,
+                    f"Unlock {name}'s session on {socket.gethostname()}"[:160], "unlock"))
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                    loop.add_signal_handler(sig, task.cancel)
+                await task
+            finally:
+                authority.db.close()
+        await send(writer, "approved", request_id)
+    except (Exception, asyncio.CancelledError) as error:
+        audit(f"unlock-not-approved: {type(error).__name__}: {error}"[:300])
+        await send(writer, "error", request_id, message=str(error)[:180])
+
+
 async def run_stdio(uid):
     reader = asyncio.StreamReader(limit=MAX_MESSAGE)
     loop = asyncio.get_running_loop()
@@ -688,6 +885,9 @@ async def run_stdio(uid):
         if event.get("event") == "remote-off":
             remote_off_for_device(uid, event)
             await send(writer, "remote-off", event["request_id"])
+            return
+        if event.get("event") == "approve":
+            await approve_for_caller(uid, event, writer, loop)
             return
         with (STATE / "authority.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

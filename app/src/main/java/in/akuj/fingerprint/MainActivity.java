@@ -381,6 +381,7 @@ public final class MainActivity extends Activity {
                 challenge.setText("REQUEST\n" + request.id + "\nComputer key: "
                         + request.machineId + "\nAction: " + request.context.getActionId()
                         + "\nRequest source: " + request.context.getSource()
+                        + (request.context.getTty().isEmpty() ? "" : "\nTerminal: " + request.context.getTty())
                         + (request.execution() ? "\nWorking directory: " + request.payload.getExecution().getCwd() : ""));
                 Response previous = bridge.responseFor(request);
                 if (previous != null) {
@@ -425,12 +426,14 @@ public final class MainActivity extends Activity {
                     showPairedComputers(bridge.pairings());
                     showMachine(awaiting.machineName, awaiting.machineId, "Paired computer");
                     setStatus(enrolled ? "Phone approved by computer" : remoteEnabled ? "Remote approvals on"
-                                    : awaiting.execution() ? "Authorized on " + awaiting.machineName : "Phone approval verified",
+                                    : awaiting.execution() ? "Authorized on " + awaiting.machineName
+                                    : awaiting.approvalOnly() ? "Approved on " + awaiting.machineName : "Phone approval verified",
                             enrolled ? "The computer signed your public key and verified your biometric approval."
                                     : remoteEnabled ? awaiting.machineName + " can now reach this phone over ntfy when KDE Connect "
                                     + "can't. Turn this off in ☰ → Settings → Remote approvals."
                                     : awaiting.execution() ? "Your computer verified this phone’s signature and launched the command you approved."
                                     : awaiting.notificationOnly() ? "Your computer verified the phone’s signature. The desktop still requires its normal authentication."
+                                    : awaiting.approvalOnly() ? "Your computer verified this phone’s signature; the sudo command or sign-in that asked continues."
                                     : "The computer verified your approved certificate and your fresh signed challenge.");
                     Log.i(TAG, (enrolled ? "Enrollment" : "Authentication") + " confirmed by machine; request=" + awaiting.id);
                     awaiting = null;

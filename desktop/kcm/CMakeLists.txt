@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.22)
-project(navi-auth-kcm VERSION 0.10.0 LANGUAGES CXX)
+project(navi-auth-kcm VERSION 0.13.0 LANGUAGES CXX)
 
 set(QT_MIN_VERSION "6.6.0")
 set(KF_MIN_VERSION "6.0.0")
@@ -23,6 +23,7 @@ set(NAVI_AUTH_HOST "/usr/libexec/navi-auth/host.py" CACHE STRING "Installed host
 set(NAVI_AUTH_CONFIGURE "/usr/libexec/navi-auth/configure-authority.py" CACHE STRING "Installed configurator")
 set(NAVI_AUTH_PYTHON "/usr/bin/python3" CACHE STRING "Interpreter for host.py")
 set(NAVI_AUTH_POLKIT_CONFIGURE "/usr/libexec/navi-auth/configure" CACHE STRING "pkexec entry point for the configurator")
+set(NAVI_AUTH_PAM_SWITCH "/usr/libexec/navi-auth/navi-pam" CACHE STRING "pkexec entry point for the optional phone-approval switches")
 
 add_definitions(-DTRANSLATION_DOMAIN=\"kcm_navi_auth\")
 
@@ -31,7 +32,8 @@ target_compile_definitions(kcm_navi_auth PRIVATE
     NAVI_AUTH_HOST_DEFAULT="${NAVI_AUTH_HOST}"
     NAVI_AUTH_CONFIGURE_DEFAULT="${NAVI_AUTH_CONFIGURE}"
     NAVI_AUTH_PYTHON_DEFAULT="${NAVI_AUTH_PYTHON}"
-    NAVI_AUTH_POLKIT_CONFIGURE_DEFAULT="${NAVI_AUTH_POLKIT_CONFIGURE}")
+    NAVI_AUTH_POLKIT_CONFIGURE_DEFAULT="${NAVI_AUTH_POLKIT_CONFIGURE}"
+    NAVI_AUTH_PAM_SWITCH_DEFAULT="${NAVI_AUTH_PAM_SWITCH}")
 target_link_libraries(kcm_navi_auth PRIVATE
     Qt::Core Qt::DBus Qt::Gui Qt::Quick
     KF6::CoreAddons KF6::I18n KF6::KCMUtilsQuick)

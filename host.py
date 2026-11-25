@@ -160,9 +160,9 @@ def check_message_size(message, what="Request"):
         raise ValueError(f"{what} too large for the phone ({size} bytes; at most {MAX_MESSAGE})")
 
 
-MODES = {"execute": "MODE_EXECUTE", "notification-only": "MODE_NOTIFICATION_ONLY"}
+MODES = {"execute": "MODE_EXECUTE", "notification-only": "MODE_NOTIFICATION_ONLY", "approve": "MODE_APPROVE"}
 CONTEXT_TEXT = ("application", "action_id", "command", "requesting_user", "target_user", "source", "icon_name",
-                "requester_executable")
+                "requester_executable", "tty")
 CONTEXT_FIELDS = set(CONTEXT_TEXT) | {"requesting_uid", "mode", "icon_sha256", "icon_png_base64",
                                       "desktop_request_id", "requester_pid", "command_hidden"}
 
@@ -171,6 +171,8 @@ def context_message(context):
     """A validated context dict (validate_context / rootauth.validate_start) as the signed Context."""
     if set(context) - CONTEXT_FIELDS:
         raise ValueError("Unsupported request context field: " + ", ".join(sorted(set(context) - CONTEXT_FIELDS)))
+    if context.get("tty") and not re.fullmatch(r"/dev/pts/[0-9]{1,6}", context["tty"]):
+        raise ValueError("Invalid requesting terminal.")
     message = pb().Context(**{name: context[name] for name in CONTEXT_TEXT if context.get(name)})
     message.requesting_uid = context["requesting_uid"]
     if context.get("mode"):
@@ -706,7 +708,7 @@ def lan_present(addresses, timeout=2.0, ports=(1716, 39841)):
 def validate_context(context):
     for name, limit, empty in (("application", 80, False), ("action_id", 160, False),
             ("command", MAX_COMMAND, True), ("requesting_user", 64, False), ("target_user", 64, False),
-            ("source", 64, False), ("icon_name", 128, True)):
+            ("source", 64, False), ("icon_name", 128, True), ("tty", 64, True)):
         value = context.get(name, "")
         if not check_layout_text(value, limit, allow_layout=name == "command") or (not empty and not value):
             raise ValueError(f"Invalid {name} display metadata.")
@@ -1280,6 +1282,33 @@ def kdesu_navi_enabled(path=KDESU):
     return KDESU_MARKER.encode("utf-16-le") in data or KDESU_MARKER.encode() in data
 
 
+def pam_approval_states():
+    """Optional phone approvals this build installed (USE=sudo / USE=login): {service: state} for
+    sudo, sddm and kde, each enabled | disabled | misplaced | outdated | unrecognized | unreadable."""
+    module_path = Path(__file__).resolve().with_name("pam_switch.py")
+    if not module_path.exists():
+        return {}
+    try:
+        spec = importlib.util.spec_from_file_location("navi_pam_switch", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # A source checkout has no installed helpers next to it, so nothing is reported there.
+        return {service: module.status(service)["state"] for service in module.available()}
+    except Exception:
+        return {}
+
+
+PAM_SERVICE_TEXT = {"sudo": "sudo in local Konsole/Kitty", "sddm": "SDDM login screen", "kde": "Plasma lock screen"}
+PAM_STATE_TEXT = {
+    "enabled": "on",
+    "disabled": "installed but off",
+    "misplaced": "NEEDS REPAIR: the line is below the password rule",
+    "outdated": "NEEDS REPAIR: the line is not the expected one",
+    "unrecognized": "unavailable: the PAM file has no auth rules (or is missing)",
+    "unreadable": "unknown: the PAM file could not be read",
+}
+
+
 def remove_admin_remote(device_id):
     """Drop remote approvals from the root copy for this KDE Connect device; True if there was one to drop."""
     status, _ = authority_request("status")
@@ -1295,16 +1324,21 @@ def remove_admin_remote(device_id):
 
 def authority_status():
     reply, error = authority_request("status")
+    pam = pam_approval_states()
     if reply is None:
-        emit("authority", available=False, error=error)
+        emit("authority", available=False, error=error, pam_approval=pam)
         say(error)
         return
     status = {name: reply.get(name) for name in ("configured", "valid", "reason", "account_matches", "enabled",
                                                  "machine_key_id", "phones") if name in reply}
     kdesu_navi = kdesu_navi_enabled()
-    emit("authority", available=True, kdesu_navi=kdesu_navi, **status)
+    emit("authority", available=True, kdesu_navi=kdesu_navi, pam_approval=pam, **status)
     if JSON_MODE:
         return
+    for service, state in pam.items():
+        repair = f" (repair: System Settings → Navi Authenticator, or navi-pam enable {service} as root)" \
+            if state in ("misplaced", "outdated") else ""
+        print(f"Phone approval for {PAM_SERVICE_TEXT.get(service, service)}: {PAM_STATE_TEXT.get(state, state)}{repair}")
     if not status.get("configured"):
         print("Administrator prompts: not configured on this computer.")
     elif not status.get("valid"):

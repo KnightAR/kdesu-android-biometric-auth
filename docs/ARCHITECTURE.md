@@ -147,6 +147,8 @@ certificate hash (which binds the phone key), operation, issue/expiry times and
 display context. Privileged
 requests additionally bind `execution` (`"shell": "/bin/sh -c"`, target credentials,
 held working-directory inode, restricted environment) and the desktop dialog ID.
+sudo, SDDM and lock-screen requests are `MODE_APPROVE` and carry no `execution`:
+the authority runs nothing, and the receipt's `execution_pid` stays 0.
 The command itself is carried once, as the signed `context.command`: it is what Navi
 shows and exactly what the authority runs with `/bin/sh -c`. Navi and the computer
 must both speak protocol v2; a peer on the old JSON format fails closed.
@@ -200,7 +202,7 @@ The authority accepts one configured desktop UID and root as target, one active
 request at a time, printable commands up to `MAX_COMMAND` characters (default
 10240, set at install with `make install MAX_COMMAND=N` or the ebuild's
 `NAVI_AUTH_MAX_COMMAND`), normal scheduling, visible commands and nonterminal
-execution. Newlines and tabs are allowed in commands; other control
+execution. Newlines and tabs are allowed in commands (sudo approval); other control
 characters, carriage returns and bidirectional overrides are not. kdesu itself
 refuses any command with a newline or tab before it starts authentication ("It
 contains invalid characters"), so kdesu commands are single-line. `kdesu -t` and `-d` are

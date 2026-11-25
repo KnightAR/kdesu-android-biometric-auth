@@ -8,11 +8,12 @@ different Wi-Fi.
 
 ## When it is used
 
-Administrator prompts (kdesu) and **Send Test → Automatic** choose the route
-per request, before it is signed:
+Administrator prompts (kdesu), sudo, the login screen, the lock screen and
+**Send Test → Automatic** choose the route per request, before it is signed:
 
 1. **KDE Connect discovery** gives the phone's current local address. If KDE
-   Connect cannot see the phone, the request goes over **ntfy**.
+   Connect cannot see the phone (or is not running yet, as at the SDDM login
+   screen), the request goes over **ntfy**.
 2. If Navi's port **39841** accepts a connection at that address, the request uses
    the **direct local network** route (Navi's pinned connection; needs
    *Enable network authentication* in Navi).
