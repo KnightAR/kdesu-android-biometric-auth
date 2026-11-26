@@ -8,7 +8,12 @@ all malicious flows are excluded.
 
 ## What approval establishes
 
-- An approved phone key signed the exact fresh request bytes.
+- An approved phone key signed its own `Approval` naming the SHA-256 of the exact
+  fresh request bytes (protocol v2, [`proto/navi.proto`](proto/navi.proto)). The
+  biometric key signs only messages Navi writes itself; every signed message is
+  typed, so one kind cannot be accepted as another. Signatures are checked over
+  the exact received bytes, which are never re-serialized. Paired requests carry
+  no certificates: Navi uses the ones stored at pairing.
 - The installed helper checks the kernel-derived desktop UID, protected trust,
   certificate, nonce, deadline, command context and one-time request consumption.
 - Android is configured to require a strong biometric for each signing operation.

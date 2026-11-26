@@ -8,19 +8,35 @@
   unsupported. **ADB enrollment and installation accept Pixel or Nexus 6P.**
   Other manufacturers are unverified and need the model restriction reviewed;
   installing an APK manually does not remove the enrollment helper restriction.
-- Linux with Python and `cryptography` **42+** for the manual host CLI. The
+- Linux with Python, `cryptography` **42+** and Python `protobuf` for the manual host
+  CLI, and `protoc` (Gentoo: `dev-libs/protobuf`) to generate `navi_pb2.py` from
+  `proto/navi.proto` with `make` before running `host.py` from a checkout. The
   installed helper, configurator and settings page run the system default
   **`/usr/bin/python3`** (on Gentoo, python-exec following `eselect python`), so a
   Python upgrade needs no change here. That default Python must have
-  `cryptography`, `dbus-python` and `pygobject`; the ebuild installs them for every
-  Python in `PYTHON_TARGETS`. Use distro packages for the protected interpreter and
-  its modules, not a user virtualenv.
+  `cryptography`, `protobuf`, `dbus-python` and `pygobject`; the ebuild installs them
+  for every Python in `PYTHON_TARGETS`. Use distro packages for the protected
+  interpreter and its modules, not a user virtualenv. `make check` runs the
+  wire-format self-test.
 - Android SDK **platforms;android-34**, **build-tools;34.0.0**, platform-tools/ADB,
-  Bash and JDK 17+. No third-party Android runtime dependencies.
+  Bash, curl and JDK 17+. The only Android runtime library is the Protocol Buffers
+  Java lite runtime; `build.sh` downloads it and the matching `protoc` (pinned by
+  SHA-256) once from Maven Central.
 - Desktop: KDE CLI Tools 6.7.2, Qt 6.10+ (Gentoo ebuild: 6.10.1+), KDE Frameworks
   and ECM 6.26+, CMake, a C/C++20 toolchain, Qt GUI private headers and the KDE
   dependencies listed in the ebuild. The installed baseline is Gentoo; this is
   not a universal install script for older KDE distributions.
+
+## Upgrading from 0.11 (JSON) to 0.12 (protobuf)
+
+Navi 0.12 and navi-auth 0.12 use the protobuf wire format (protocol v2) and do not
+talk to 0.11, so update both. **No re-enrollment is needed:** the machine identity,
+approved phones, the protected root configuration, Navi's pairings and remote
+approval (ntfy) settings are kept as they are. One thing changes on the phone:
+if *Enable network authentication* was on, the update turns it off, because its
+stored binding used the old format. Navi shows **Turn direct network approvals on
+again?** (and a notification); accept it and confirm with your fingerprint. Until
+then, requests arrive through KDE Connect or ntfy as usual.
 
 ## 1. Build the APK
 
@@ -34,8 +50,11 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 ./build.sh release --new-key   # first installation only; later: ./build.sh release
 ```
 
-SDK installation requires accepting Google's SDK licenses; the build itself is
-offline once these components are installed. See the official
+SDK installation requires accepting Google's SDK licenses. The first build also
+downloads `protobuf-javalite` and the matching `protoc` from Maven Central into
+`build/deps/` and checks them against the SHA-256 values in `build.sh`; after that
+the build is offline. To build without network access, copy those two files into
+`build/deps/` (or a directory named by `NAVI_DEPS_DIR`) first. See the official
 [sdkmanager documentation](https://developer.android.com/tools/sdkmanager).
 
 The longest command Navi accepts for review defaults to 10240 characters. To change
@@ -118,7 +137,7 @@ also offers the destination folder from step 2). In Navi open **☰ → Settings
 Set up KDE Connect**, tap **Read computer messages from Downloads** and allow
 storage access (only requested on Android 9–10). Keep Navi open during enrollment: it checks
 `Download/` when it opens, regains focus and every few seconds while visible,
-handles recent `navi-auth-*.json` files exactly like KDE Connect deliveries, and
+handles recent `navi-auth-*.pb` files exactly like KDE Connect deliveries, and
 deletes them. Enroll as above. Afterwards configure kdesu with the LAN transport
 (`--transport lan --kdeconnect-device …`), which does not depend on files.
 
@@ -252,7 +271,7 @@ EOF
 # Optional: a command limit other than 10240 characters (must not exceed Navi's):
 #   echo 'NAVI_AUTH_MAX_COMMAND=4096' > /etc/portage/env/navi-auth.conf
 #   echo 'sys-auth/navi-auth navi-auth.conf' >> /etc/portage/package.env
-ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/sys-auth/navi-auth/navi-auth-0.11.0.ebuild manifest
+ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/sys-auth/navi-auth/navi-auth-0.12.0.ebuild manifest
 ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/kde-misc/navi-auth-kcm/navi-auth-kcm-0.10.0.ebuild manifest
 ebuild /var/db/repos/kdesu-biometric-source/packaging/kde-repo/kde-plasma/kdesu-gui/kdesu-gui-6.8.2-r1.ebuild manifest
 # Keep Plasma upgrades from silently replacing the Navi-patched kdesu with Gentoo's:
@@ -260,7 +279,7 @@ ebuild /var/db/repos/kdesu-biometric-source/packaging/kde-repo/kde-plasma/kdesu-
 install -d -m 0755 /etc/portage/package.mask
 echo 'kde-plasma/kdesu-gui::gentoo' > /etc/portage/package.mask/navi-kdesu
 emerge --pretend --verbose --oneshot \
-  '=sys-auth/navi-auth-0.11.0::navi-auth-local' \
+  '=sys-auth/navi-auth-0.12.0::navi-auth-local' \
   '=kde-misc/navi-auth-kcm-0.10.0::navi-auth-local' \
   '=kde-plasma/kdesu-gui-6.8.2-r1::navi-kde-local'
 ```
@@ -272,7 +291,7 @@ After accepting the exact plan:
 
 ```sh
 emerge --ask=n --oneshot --usepkg=n --getbinpkg=n --autounmask=n \
-  '=sys-auth/navi-auth-0.11.0::navi-auth-local' \
+  '=sys-auth/navi-auth-0.12.0::navi-auth-local' \
   '=kde-misc/navi-auth-kcm-0.10.0::navi-auth-local' \
   '=kde-plasma/kdesu-gui-6.8.2-r1::navi-kde-local'
 ```

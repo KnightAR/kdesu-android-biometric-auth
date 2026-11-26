@@ -11,10 +11,30 @@ and revocation as changes to the authorization boundary.
 - `host.py`: unprivileged enrollment, authentication and revocation diagnostics.
 - `authorize.c`, `rootauth.py`, `configure-authority.py`: protected desktop path.
 - `kdeconnect_transport.py`: optional existing KDE Connect sharing transport.
+- `ntfy_transport.py`: optional remote approvals over an ntfy server.
+- `proto/navi.proto`: the wire format shared by the computer and Navi.
+- `tools/wire_check.py`: wire-format self-test (`make check`).
 - `packaging/repo/`: Gentoo navi-auth package with the deployed source snapshot.
 - `packaging/kde-repo/`: KDE split ebuild and complete downstream patch, including
   the existing dialog/client test suites and preview fixture.
 - `docs/`: setup, protocol, operation, audit and verification.
+
+### Wire format
+
+Every message between the computer and Navi is defined in
+[`proto/navi.proto`](proto/navi.proto). The desktop generates `navi_pb2.py` from it
+(`make`), Navi generates Java lite classes (`build.sh`); generated code is not
+committed. When changing the schema:
+
+- Add fields; never renumber or reuse one. Retire a field with `reserved`.
+- Keep field numbers 1–15 (one tag byte) for fields every request sends.
+- Unknown fields are ignored, so a change that alters security meaning (a new
+  constraint Navi must honour, a different binding) must also change `Protocol`.
+- Signatures cover the exact received bytes: verify, then parse, and never
+  re-serialize a received message to check it.
+- Run `make check` (desktop self-test) and build the APK. The two sides use
+  different `protoc` versions (system on the desktop, pinned in `build.sh` for
+  Navi), which the wire format allows.
 
 Root-level host files intentionally match the package copies. Update both when
 making a runtime change; the build workflow checks their equality. Version future

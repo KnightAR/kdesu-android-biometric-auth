@@ -24,13 +24,21 @@ jobs:
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             'platforms;android-34' 'build-tools;34.0.0'
-      - name: Check shell, Python, native build and packaged source
+      - name: Install protoc and Python protobuf for the desktop wire format
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler python3-protobuf python3-cryptography
+      - name: Check shell, Python, wire format, native build and packaged source
         run: |
           bash -n build.sh install.sh
-          python3 -m py_compile host.py rootauth.py configure-authority.py kdeconnect_transport.py
+          make navi_pb2.py
+          /usr/bin/python3 -m py_compile host.py rootauth.py navi_pb2.py configure-authority.py \
+            kdeconnect_transport.py ntfy_transport.py tools/wire_check.py
+          make check
           mkdir -p build
           cc -Wall -Wextra -Werror -fPIE -pie -Wl,-z,relro,-z,now -o build/authorize authorize.c
-          for source in authorize.c rootauth.py host.py configure-authority.py kdeconnect_transport.py; do
+          for source in authorize.c rootauth.py host.py configure-authority.py kdeconnect_transport.py \
+              ntfy_transport.py Makefile proto/navi.proto; do
             cmp "$source" "packaging/repo/sys-auth/navi-auth/files/$source"
           done
       - name: Build both modes with a disposable signer

@@ -62,12 +62,12 @@ types into the phone, carried over an existing KDE Connect pairing:
    `enroll-offer` with the selected KDE Connect device and shows an 8-character
    Crockford-base32 code (40 bits, 10-minute lifetime). The offer carries the
    machine CA certificate, host name, the desktop's KDE Connect ID and
-   `HMAC-SHA256(code, "navi-enroll-offer/v1\n" || payload)`.
+   `HMAC-SHA256(code, "navi-enroll-offer/v2\n" || payload)`.
 2. The phone stores up to four unexpired offers but trusts none of them. When the
    typed code matches one offer's tag (five wrong attempts drop an offer), the
    phone pins that machine key and desktop route for the offer's lifetime and
    shares back an `enroll-hello`: its public key and key ID tagged with the same
-   code under the `navi-enroll-hello/v1` label.
+   code under the `navi-enroll-hello/v2` label.
 3. The computer accepts the hello only from the selected device, verifies the tag
    and key ID, issues the phone certificate and sends the normal `enroll` request
    bound to the `kdeconnect-share` transport.
@@ -79,7 +79,7 @@ Offers from other paired devices or apps cannot match the code the user is
 reading, and all messages stay inside KDE Connect's paired channel, so the short
 code is not exposed to offline guessing. Delivery to the phone is automatic with
 Navi as the KDE Connect destination (Android 10+). On Android 9–10 Navi can
-instead import recent `navi-auth-*.json` files from `Download/` while it is open.
+instead import recent `navi-auth-*.pb` files from `Download/` while it is open.
 A saved offer the user opens with Navi or the file picker (offers only) is fully
 validated, but it is stored for code entry only when Navi can follow the rest of
 the enrollment from Downloads. Otherwise (Android 11+, or no storage access) Navi
@@ -102,18 +102,54 @@ verifier in this project. Fingerprint templates do not leave Android.
 
 ## Wire format and freshness
 
-The phone protocol domain is `android-linux-fingerprint/v1`. JSON envelopes carry
-base64-encoded exact UTF-8 payload bytes and DER ECDSA/SHA-256 signatures. Public
-keys are DER SubjectPublicKeyInfo; certificates are DER X.509. Verifiers check
-the original decoded bytes rather than reserializing received objects.
+Every message between the computer and Navi is a Protocol Buffers message defined in
+one schema, [`proto/navi.proto`](../proto/navi.proto) (package `navi.v2`). The
+desktop generates `navi_pb2.py` from it (`make`, system `protoc`); Navi generates
+Java lite classes (`build.sh`, pinned `protoc` matching the bundled javalite runtime).
+There is no compression and no dictionary.
 
-Requests bind request ID, random 256-bit nonce, machine/phone key IDs, approved
-certificate hash, operation, issue/expiry times and display context. Privileged
+- **Signed bytes.** Everything any key signs is a `Payload{protocol, oneof body}`. A
+  `Signed{payload, signature}` carries the exact serialized bytes and a DER
+  ECDSA P-256/SHA-256 signature over them. Verifiers check the signature over the
+  received bytes first, then parse them, and never re-serialize anything they received,
+  so no canonical encoding is needed. A verifier requires `protocol == PROTOCOL_NAVI_V2`
+  and the expected oneof case, so one kind of signed message (a cancel, an approval)
+  can never be accepted as another. Public keys are DER SubjectPublicKeyInfo;
+  certificates are DER X.509; IDs, nonces and hashes are raw bytes of fixed length.
+- **What the phone signs.** The biometric key signs only messages Navi writes itself:
+  `Approval{request_sha256}`, the SHA-256 of the exact request bytes (for remote setup
+  also `phone_ecdh_spki`, Navi's fresh key-agreement key), and the
+  `NetworkIdentity` binding of its TLS certificate. The response carries that
+  `Signed` approval; the computer checks it against the request bytes it stored.
+- **Certificates by reference.** Only an enrollment request carries the machine and
+  phone certificates. Every other request omits them: Navi reads `machine_id` from the
+  unverified payload only to find the stored pairing, verifies the signature with the
+  stored machine certificate, and requires `certificate_sha256` to equal the stored
+  phone certificate's hash. A paired request that carries certificates is refused.
+- **Compatibility rule.** Unknown fields are ignored, as in any protobuf. A change
+  that alters security meaning (a new constraint Navi must honour) must change
+  `Protocol`, so an older peer refuses it instead of ignoring it. Retired fields are
+  `reserved` (the former `phone_key_id` request field is). In `Request`, the random
+  `request_id` and `nonce` come before any caller-supplied text, so a chosen-prefix
+  hash collision cannot be aimed at the signed bytes.
+- **Framing.** KDE Connect files (`navi-auth-<kind>-<id>.pb`) are one `Mail` each. The
+  direct network route exchanges 4-byte big-endian length-prefixed frames (at most
+  128 KiB): Navi's `NetworkHello` (identity statement, fresh nonce), one machine-signed
+  `NetworkRpc` bound to that nonce, and a `NetworkReply`. Over ntfy each message is an
+  AES-256-GCM-sealed `RemoteMessage`.
+- **Sizes.** A typical request is about 450 bytes as a KDE Connect file and about 580
+  characters over ntfy (JSON 52e471a: 2,622 bytes and 1,937 characters); a response
+  is 138 bytes. Commands up to about 2,470 characters stay inline on ntfy; longer ones
+  travel as an ntfy attachment.
+
+Requests bind request ID, random 256-bit nonce, machine key ID, approved
+certificate hash (which binds the phone key), operation, issue/expiry times and
+display context. Privileged
 requests additionally bind `execution` (`"shell": "/bin/sh -c"`, target credentials,
 held working-directory inode, restricted environment) and the desktop dialog ID.
 The command itself is carried once, as the signed `context.command`: it is what Navi
-shows and exactly what the authority runs with `/bin/sh -c`. Navi rejects a request
-that still carries an older `argv` copy, so mismatched versions fail closed.
+shows and exactly what the authority runs with `/bin/sh -c`. Navi and the computer
+must both speak protocol v2; a peer on the old JSON format fails closed.
 Approval and commit share a 120-second deadline. SQLite consumes each pending
 proof once. A certificate by itself is not a reusable authentication token.
 
@@ -238,19 +274,19 @@ test routes (`--kdeconnect-messages`, `--kdeconnect-device`, `--remote-only`)
 use `RoutedPhone` or a single transport.
 
 - Setup is a `remote-setup` request over the normal route. The computer's
-  ephemeral P-256 key is inside the signed payload; Navi signs
-  `payload ‖ "\n" ‖ its ephemeral P-256 SPKI` with the biometric key. Both sides
-  derive the message key and both inbox topic names with HKDF-SHA256 (salt: setup
-  request id); none of them is transmitted.
-- Messages are `base64url(nonce ‖ AES-256-GCM(DEFLATE(json)))` with AAD
-  `navi-remote/v1\n<direction>\n<topic>`; inflate is capped at 64 KiB. Requests carry
-  the signed payload as exact JSON text (`payload_json`); receipts and cancels refer
-  to the request by `request_sha256`; responses carry only the signature. Each side
-  rebuilds the usual mailbox objects and validates them unchanged.
-- Signed requests sent over ntfy carry `remote: {"kind": "ntfy"}` and, instead of
-  the inline PNG, `context.icon_sha256`. Navi caches icons by hash and asks
-  (`icon-request`) for a missing one; the computer answers only with the PNG of the
-  current request.
+  ephemeral P-256 key is inside the signed request; Navi's biometric `Approval` of
+  that request also carries its own ephemeral P-256 SPKI. Both sides derive the
+  message key and both inbox topic names with HKDF-SHA256 (salt: setup request id,
+  labels `navi-remote/v1 …`, unchanged by protocol v2 so existing setups keep
+  working); none of them is transmitted.
+- Messages are `base64url(nonce ‖ AES-256-GCM(RemoteMessage))` with AAD
+  `navi-remote/v2\n<direction>\n<topic>` and no compression; plaintext is capped
+  at 64 KiB. A request is the same `RequestEnvelope` as on the other routes. Receipts
+  and cancels are matched to the request Navi holds by request ID and verified as
+  usual; responses are the same `Response` (the phone's signed `Approval`).
+- Signed requests sent over ntfy carry `remote` and, instead of the inline PNG,
+  `context.icon_sha256`. Navi caches icons by hash and asks (`IconRequest`) for a
+  missing one; the computer answers only with the PNG of the current request.
 - On the computer the HTTP client is a worker process running as the desktop user
   that moves only ciphertext; in `rootauth.py` the key stays in the root process.
   On the phone, `NetworkService` holds one streaming subscription per server and

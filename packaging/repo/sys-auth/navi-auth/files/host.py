@@ -31,12 +31,15 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 PACKAGE = "in.akuj.fingerprint"
-DOMAIN = "android-linux-fingerprint/v1"
 STATE = Path(__file__).resolve().parent / ".state"
 TTL = 120
 MAX_COMMAND = 10240  # set by make install (MAX_COMMAND=...); Navi's own build limit must be at least this
 MAX_PAYLOAD = 131072  # signed payload; the wire message itself stays within 64 KiB
 MAX_MESSAGE = 65536  # one request/response/receipt file or network message
+MAX_FRAME = 131072  # one direct-network frame
+OFFER_LABEL = "navi-enroll-offer/v2"
+HELLO_LABEL = "navi-enroll-hello/v2"
+UPDATE_HINT = "update Navi and navi-auth together"
 
 
 def b64(data):
@@ -64,6 +67,213 @@ def spki(key):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256(data):
+    return hashlib.sha256(data).digest()
+
+
+# --- Wire format (proto/navi.proto) -----------------------------------------------------
+# Every message to or from Navi is protobuf. Signed messages carry the exact serialized
+# Payload bytes; verifiers check the signature over those bytes and only then parse them,
+# never re-serializing anything they received.
+_PB = None
+
+
+def pb():
+    """The navi_pb2 module generated beside this file (make). Loaded by path: the protected
+    helpers run Python with -I, which keeps this directory off sys.path."""
+    global _PB
+    if _PB is None:
+        module = sys.modules.get("navi_pb2")
+        if module is None:
+            path = Path(__file__).with_name("navi_pb2.py")
+            if not path.is_file():
+                raise RuntimeError(f"{path} is missing; generate it with make (protoc, proto/navi.proto)")
+            spec = importlib.util.spec_from_file_location("navi_pb2", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sys.modules["navi_pb2"] = module
+        _PB = module
+    return _PB
+
+
+def wire(message):
+    return message.SerializeToString(deterministic=True)
+
+
+def parse(name, raw, limit=MAX_MESSAGE):
+    """Untrusted bytes as navi.v2.<name>, size-capped before parsing."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > limit:
+        raise ValueError(f"Invalid or oversized {name}")
+    message = getattr(pb(), name)()
+    try:
+        message.ParseFromString(bytes(raw))
+    except Exception:
+        raise ValueError(f"Malformed {name} ({UPDATE_HINT})") from None
+    return message
+
+
+def exact(value, size, what):
+    value = bytes(value)
+    if len(value) != size:
+        raise ValueError(f"Invalid {what}")
+    return value
+
+
+def signed_payload(body, message):
+    payload = pb().Payload(protocol=pb().PROTOCOL_NAVI_V2)
+    getattr(payload, body).CopyFrom(message)
+    raw = wire(payload)
+    if len(raw) > MAX_PAYLOAD:
+        raise ValueError(f"Signed message too large for the phone ({len(raw)} bytes)")
+    return raw
+
+
+def sign(key, body, message):
+    """(exact signed bytes, Signed) for Payload{body: message}."""
+    raw = signed_payload(body, message)
+    return raw, pb().Signed(payload=raw, signature=key.sign(raw, ec.ECDSA(hashes.SHA256())))
+
+
+def peek(raw, body):
+    """The body of Payload bytes, checking protocol and type. Unverified: only for lookups,
+    or after open_signed()."""
+    payload = parse("Payload", raw, MAX_PAYLOAD)
+    if payload.protocol != pb().PROTOCOL_NAVI_V2:
+        raise ValueError(f"Unsupported message protocol ({UPDATE_HINT})")
+    if payload.WhichOneof("body") != body:
+        raise ValueError(f"Expected a signed {body.replace('_', ' ')}")
+    return getattr(payload, body)
+
+
+def open_signed(signed, public_key, body):
+    """Verify, then parse: (exact signed bytes, body)."""
+    raw = bytes(signed.payload)
+    public_key.verify(bytes(signed.signature), raw, ec.ECDSA(hashes.SHA256()))
+    return raw, peek(raw, body)
+
+
+def check_message_size(message, what="Request"):
+    size = message.ByteSize()
+    if size > MAX_MESSAGE:
+        raise ValueError(f"{what} too large for the phone ({size} bytes; at most {MAX_MESSAGE})")
+
+
+MODES = {"execute": "MODE_EXECUTE", "notification-only": "MODE_NOTIFICATION_ONLY"}
+CONTEXT_TEXT = ("application", "action_id", "command", "requesting_user", "target_user", "source", "icon_name",
+                "requester_executable")
+CONTEXT_FIELDS = set(CONTEXT_TEXT) | {"requesting_uid", "mode", "icon_sha256", "icon_png_base64",
+                                      "desktop_request_id", "requester_pid", "command_hidden"}
+
+
+def context_message(context):
+    """A validated context dict (validate_context / rootauth.validate_start) as the signed Context."""
+    if set(context) - CONTEXT_FIELDS:
+        raise ValueError("Unsupported request context field: " + ", ".join(sorted(set(context) - CONTEXT_FIELDS)))
+    message = pb().Context(**{name: context[name] for name in CONTEXT_TEXT if context.get(name)})
+    message.requesting_uid = context["requesting_uid"]
+    if context.get("mode"):
+        if context["mode"] not in MODES:
+            raise ValueError("Unsupported request mode")
+        message.mode = getattr(pb(), MODES[context["mode"]])
+    if context.get("icon_sha256"):
+        message.icon_sha256 = bytes.fromhex(context["icon_sha256"])
+    if context.get("icon_png_base64"):
+        message.icon_png = unb64(context["icon_png_base64"])
+    if context.get("desktop_request_id"):
+        message.desktop_request_id = uuid.UUID(context["desktop_request_id"]).bytes
+    if context.get("requester_pid"):
+        message.requester_pid = context["requester_pid"]
+    if context.get("command_hidden"):
+        message.command_hidden = True
+    return message
+
+
+def execution_message(execution):
+    return pb().Execution(shell=execution["shell"], uid=execution["uid"], gid=execution["gid"], cwd=execution["cwd"],
+                          cwd_device=execution["cwd_device"], cwd_inode=execution["cwd_inode"],
+                          environment=[pb().EnvVar(name=name, value=value)
+                                       for name, value in sorted(execution["environment"].items())])
+
+
+def request_message(kind, request_id, machine_id, leaf_der, operation, issued_at_ms, expires_at_ms, context,
+                    execution=None, transport=None, remote=False, remote_setup=None):
+    """The signed challenge. request_id is 16 bytes, machine_id the hex SPKI hash."""
+    request = pb().Request(kind=kind, request_id=exact(request_id, 16, "request ID"), nonce=secrets.token_bytes(32),
+                           machine_id=bytes.fromhex(machine_id), certificate_sha256=sha256(leaf_der),
+                           machine_name=socket.gethostname(), operation=operation,
+                           issued_at_ms=issued_at_ms, expires_at_ms=expires_at_ms)
+    request.context.CopyFrom(context_message(context))
+    if execution is not None:
+        request.execution.CopyFrom(execution_message(execution))
+    if transport is not None:
+        request.transport.desktop_device_id = transport["desktop_device_id"]
+    if remote:
+        request.remote.SetInParent()
+    if remote_setup is not None:
+        request.remote_setup.CopyFrom(remote_setup)
+    return request
+
+
+def request_envelope(key, request, root=None, leaf_der=None):
+    """(exact signed bytes, RequestEnvelope). Only enrollment carries the certificates; Navi
+    resolves every other request's certificates from its stored pairing."""
+    raw, signed = sign(key, "request", request)
+    envelope = pb().RequestEnvelope(signed=signed)
+    if request.kind == pb().KIND_ENROLL:
+        envelope.machine_certificate = root.public_bytes(serialization.Encoding.DER)
+        envelope.phone_certificate = leaf_der
+    check_message_size(envelope)
+    return raw, envelope
+
+
+def verify_response(response, request_raw, leaf, setup=False):
+    """The phone's biometric Approval of exactly these request bytes: (signature, phone ECDH key DER or None)."""
+    if response.status == pb().STATUS_DECLINED:
+        raise ValueError("Phone declined: " + (response.message[:200] or "approval canceled"))
+    if response.status != pb().STATUS_SIGNED or not response.HasField("approval"):
+        raise ValueError("Invalid phone response")
+    _, approval = open_signed(response.approval, leaf.public_key(), "approval")
+    if not hmac.compare_digest(bytes(approval.request_sha256), sha256(request_raw)):
+        raise ValueError("Response does not match the outstanding challenge.")
+    phone_ecdh = bytes(approval.phone_ecdh_spki)
+    if setup:
+        key = serialization.load_der_public_key(phone_ecdh)
+        if not isinstance(key, ec.EllipticCurvePublicKey) or not isinstance(key.curve, ec.SECP256R1):
+            raise ValueError("The phone's remote key must be P-256.")
+    elif phone_ecdh:
+        raise ValueError("Unexpected key agreement in the phone's approval.")
+    return bytes(response.approval.signature), phone_ecdh or None
+
+
+def receipt_message(key, request_id, signature, execution_pid=0):
+    return sign(key, "receipt", pb().Receipt(request_id=request_id, response_sha256=sha256(signature),
+                                             status=pb().RECEIPT_APPROVED, execution_pid=execution_pid))[1]
+
+
+def cancel_message(key, request_id, request_raw):
+    return sign(key, "cancel", pb().Cancel(request_id=request_id, request_sha256=sha256(request_raw)))[1]
+
+
+def read_frame(stream):
+    """One length-prefixed direct-network frame (4-byte big-endian length)."""
+    header = stream.read(4)
+    if len(header) != 4:
+        raise ValueError("Invalid network frame")
+    size = struct.unpack(">I", header)[0]
+    if not 0 < size <= MAX_FRAME:
+        raise ValueError("Invalid network frame")
+    data = stream.read(size)
+    if len(data) != size:
+        raise ValueError("Truncated network frame")
+    return data
+
+
+def frame(data):
+    if not 0 < len(data) <= MAX_FRAME:
+        raise ValueError("Network message exceeds size limit")
+    return struct.pack(">I", len(data)) + data
 
 
 def atomic_write(path, data):
@@ -151,29 +361,36 @@ class Phone:
             raise RuntimeError(result.stderr.decode(errors="replace").strip() or "ADB command failed")
         return result.stdout if result.returncode == 0 else b""
 
-    def read(self, name):
+    def _cat(self, filename):
         # shell v2 preserves the remote exit status/stderr; exec-out reports a
-        # missing file's error text as stdout with success, which is not JSON.
-        raw = self.adb("shell", "-T", "run-as", PACKAGE, "cat", "files/" + name, optional=True)
-        if len(raw) > 65536:
+        # missing file's error text as stdout with success.
+        raw = self.adb("shell", "-T", "run-as", PACKAGE, "cat", "files/" + filename, optional=True)
+        if len(raw) > MAX_MESSAGE:
             raise ValueError("Phone response exceeds the size limit.")
-        return json.loads(raw) if raw else None
+        return raw
+
+    def read(self, name):
+        if name != "response":
+            raise ValueError("Unexpected bridge filename.")
+        raw = self._cat("response.pb")
+        return parse("Response", raw) if raw else None
 
     def write(self, name, value):
         # Fixed filenames, payload via stdin, and no user text interpolated into a shell.
-        if name not in {"request.json", "receipt.json", "cancel.json"}:
+        if name not in {"request", "receipt", "cancel"}:
             raise ValueError("Unexpected bridge filename.")
-        if len(encode(value)) > 65536:
+        data = wire(value)
+        if len(data) > MAX_MESSAGE:
             raise ValueError("Computer message exceeds the size limit.")
-        temporary = "files/" + name + ".tmp"
+        temporary = "files/" + name + ".pb.tmp"
         self.adb("shell", "-T", "run-as", PACKAGE, "sh", "-c",
-                 "'cat > " + temporary + " && mv " + temporary + " files/" + name + "'", data=encode(value))
+                 "'cat > " + temporary + " && mv " + temporary + " files/" + name + ".pb'", data=data)
 
     def identity(self):
         for _ in range(15):
-            value = self.read("identity.json")
-            if value:
-                return value
+            raw = self._cat("identity.json")
+            if raw:
+                return json.loads(raw)
             time.sleep(1)
         raise ValueError("The app has not published its key. Check its on-screen status and biometric enrollment.")
 
@@ -198,7 +415,7 @@ class NetworkPhone:
         self.key, self.root, self.leaf = machine_key, root, leaf
         self.machine_id = digest(spki(root.public_key()))
         self.phone_id = digest(spki(leaf.public_key()))
-        self.request_id = None
+        self.request_id = b""
 
     def _set_endpoint(self, endpoint):
         import ipaddress
@@ -209,16 +426,6 @@ class NetworkPhone:
         if not address.is_private or address.is_loopback or address.is_unspecified or address.is_multicast:
             raise ValueError("Phone endpoint must be a private LAN address")
         self.address = (str(address), int(port))
-
-    @staticmethod
-    def _read(stream):
-        raw = stream.readline(131073)
-        if len(raw) > 131072 or not raw.endswith(b"\n"):
-            raise ValueError("Invalid network frame")
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError("Invalid network object")
-        return value
 
     def _connect(self):
         deadline = time.monotonic() + 15
@@ -265,19 +472,15 @@ class NetworkPhone:
             sockets[0] = connection
             connection.do_handshake()
             stream = connection.makefile("rwb")
-            hello = self._read(stream)
-            identity = hello["identity"]
-            payload = unb64(identity["payload_b64"])
-            self.leaf.public_key().verify(unb64(identity["signature_b64"]), payload, ec.ECDSA(hashes.SHA256()))
-            statement = json.loads(payload)
-            if statement.get("domain") != DOMAIN or statement.get("kind") != "network-identity" or statement.get("phone_key_id") != self.phone_id:
+            hello = parse("NetworkHello", read_frame(stream), MAX_FRAME)
+            _, statement = open_signed(hello.identity, self.leaf.public_key(), "network_identity")
+            if bytes(statement.phone_key_id) != bytes.fromhex(self.phone_id):
                 raise ValueError("Network identity does not match the approved phone")
-            if unb64(statement["tls_certificate_b64"]) != connection.getpeercert(binary_form=True):
+            if bytes(statement.tls_certificate) != connection.getpeercert(binary_form=True):
                 raise ValueError("TLS peer is not the phone's biometrically approved transport")
-            if len(unb64(hello["nonce"])) != 32:
-                raise ValueError("Invalid server challenge")
+            nonce = exact(hello.nonce, 32, "server challenge")
             validate_certificate(self.leaf, self.root)
-            return connection, stream, hello["nonce"], watchdog
+            return connection, stream, nonce, watchdog
         except BaseException:
             watchdog.cancel()
             if stream is not None:
@@ -300,34 +503,36 @@ class NetworkPhone:
     def _exchange(self, operation, name, value=None):
         connection, stream, nonce, watchdog = self._connect()
         try:
-            payload = dict(domain=DOMAIN, kind="network-rpc", machine_id=self.machine_id,
-                           phone_key_id=self.phone_id, server_nonce=nonce, operation=operation,
-                           name=name, request_id=self.request_id, value=value)
-            raw = encode(envelope(self.key, payload)) + b"\n"
-            if len(raw) > 131072:
-                raise ValueError("Network request exceeds size limit")
-            stream.write(raw)
+            rpc = pb().NetworkRpc(machine_id=bytes.fromhex(self.machine_id), server_nonce=nonce, operation=operation,
+                                  name=name, request_id=self.request_id)
+            if value is not None:
+                rpc.value.CopyFrom(value)
+            stream.write(frame(wire(sign(self.key, "network_rpc", rpc)[1])))
             stream.flush()
-            result = self._read(stream)
-            if result.get("ok") is not True:
+            reply = parse("NetworkReply", read_frame(stream), MAX_FRAME)
+            if not reply.ok:
                 raise ValueError("Phone rejected the network request")
-            return result.get("value")
+            return reply.value if reply.HasField("value") else None
         finally:
             watchdog.cancel()
             stream.close()
             connection.close()
 
     def write(self, name, value):
-        if name not in {"request.json", "receipt.json", "cancel.json"} or len(encode(value)) > 65536:
+        names = {"request": pb().MAIL_REQUEST, "receipt": pb().MAIL_RECEIPT, "cancel": pb().MAIL_CANCEL}
+        if name not in names or value.ByteSize() > MAX_MESSAGE:
             raise ValueError("Invalid computer message")
-        if name == "request.json":
-            self.request_id = json.loads(unb64(value["payload_b64"]))["request_id"]
-        self._exchange("write", name, value)
+        if name == "request":
+            self.request_id = bytes(peek(value.signed.payload, "request").request_id)
+        mail = pb().Mail()
+        getattr(mail, name).CopyFrom(value)
+        self._exchange(pb().OP_WRITE, names[name], mail)
 
     def read(self, name):
-        if name != "response.json":
+        if name != "response":
             raise ValueError("Invalid response name")
-        return self._exchange("read", name)
+        mail = self._exchange(pb().OP_READ, pb().MAIL_RESPONSE)
+        return mail.response if mail is not None and mail.WhichOneof("value") == "response" else None
 
     def notify(self, request_id, canceled=False):
         pass  # The phone validates and posts/withdraws its notification on delivery.
@@ -498,19 +703,6 @@ def lan_present(addresses, timeout=2.0, ports=(1716, 39841)):
     return present.is_set()
 
 
-def envelope(key, payload):
-    raw = encode(payload)
-    if len(raw) > MAX_PAYLOAD:
-        raise ValueError(f"Request too large for the phone ({len(raw)} bytes)")
-    return {"payload_b64": b64(raw), "signature_b64": b64(key.sign(raw, ec.ECDSA(hashes.SHA256())))}
-
-
-def check_message_size(value, what="Request"):
-    size = len(encode(value))
-    if size > MAX_MESSAGE:
-        raise ValueError(f"{what} too large for the phone ({size} bytes; at most {MAX_MESSAGE})")
-
-
 def validate_context(context):
     for name, limit, empty in (("application", 80, False), ("action_id", 160, False),
             ("command", MAX_COMMAND, True), ("requesting_user", 64, False), ("target_user", 64, False),
@@ -634,19 +826,28 @@ def code_tag(code, label, payload):
 
 def verify_hello(hello, code, session_id, machine_id):
     """The phone's key is only accepted with a tag made from the code the user typed."""
-    if not isinstance(hello, dict) or hello.get("request_id") != session_id or hello.get("kind") != "enroll-hello":
+    if hello is None:
         return None
-    raw = unb64(hello["payload_b64"])
-    if len(raw) > 8192 or not hmac.compare_digest(unb64(hello["code_tag_b64"]), code_tag(code, "navi-enroll-hello/v1", raw)):
+    raw = bytes(hello.payload)
+    if len(raw) > 8192 or not hmac.compare_digest(bytes(hello.code_tag), code_tag(code, HELLO_LABEL, raw)):
         raise ValueError("Phone confirmation does not match the pairing code.")
-    value = json.loads(raw)
-    if (not isinstance(value, dict) or value.get("domain") != DOMAIN or value.get("kind") != "enroll-hello"
-            or value.get("session_id") != session_id or value.get("machine_id") != machine_id):
+    value = peek(raw, "enroll_hello")
+    if bytes(value.session_id) != session_id or bytes(value.machine_id) != bytes.fromhex(machine_id):
         raise ValueError("Phone confirmation is for another pairing.")
-    public_der = unb64(value["public_key_spki_base64"])
-    if value.get("phone_key_id") != digest(public_der):
+    public_der = bytes(value.public_key_spki)
+    if bytes(value.phone_key_id) != sha256(public_der):
         raise ValueError("Phone public-key ID mismatch.")
     return dict(key_id_sha256=digest(public_der), public_key_spki_base64=b64(public_der))
+
+
+def offer_message(machine_key, root, code, session_id, desktop_device_id, now):
+    """The machine-signed pairing offer, tagged with the code the user will type on the phone."""
+    offer = pb().EnrollOffer(session_id=session_id, machine_id=sha256(spki(root.public_key())),
+                             machine_name=socket.gethostname(), desktop_device_id=desktop_device_id,
+                             issued_at_ms=now, expires_at_ms=now + OFFER_TTL * 1000)
+    raw, signed = sign(machine_key, "enroll_offer", offer)
+    return pb().OfferEnvelope(signed=signed, machine_certificate=root.public_bytes(serialization.Encoding.DER),
+                              code_tag=code_tag(code, OFFER_LABEL, raw))
 
 
 def pair_with_code(device, machine_key, root):
@@ -654,22 +855,16 @@ def pair_with_code(device, machine_key, root):
     transport = kdeconnect_transport()(sys.modules[__name__], device["id"], machine_key, root, None)
     try:
         code = pairing_code()
-        session_id = secrets.token_hex(16)
+        session_id = secrets.token_bytes(16)
         machine_id = digest(spki(root.public_key()))
         now = int(time.time() * 1000)
-        payload = {"domain": DOMAIN, "kind": "enroll-offer", "session_id": session_id,
-                   "machine_id": machine_id, "machine_name": socket.gethostname(),
-                   "desktop_device_id": transport.transport["desktop_device_id"],
-                   "issued_at_ms": now, "expires_at_ms": now + OFFER_TTL * 1000}
-        offer = envelope(machine_key, payload)
-        offer["machine_certificate_b64"] = b64(root.public_bytes(serialization.Encoding.DER))
-        offer["code_tag_b64"] = b64(code_tag(code, "navi-enroll-offer/v1", encode(payload)))
+        offer = offer_message(machine_key, root, code, session_id, transport.transport["desktop_device_id"], now)
         transport.check()
-        transport.send_offer(session_id, offer)
+        transport.send_offer(session_id.hex(), offer)
         shown = f"{code[:4]}-{code[4:]}"
         emit("step", step="offer-sent", device_id=device["id"], device_name=device["name"])
-        offer_file = f"navi-auth-enroll-offer-{session_id}.json"
-        emit("code", code=shown, expires_at_ms=payload["expires_at_ms"], machine_id=machine_id, offer_file=offer_file)
+        offer_file = f"navi-auth-enroll-offer-{session_id.hex()}.pb"
+        emit("code", code=shown, expires_at_ms=now + OFFER_TTL * 1000, machine_id=machine_id, offer_file=offer_file)
         say(f"\nPair with {device['name']}")
         say("  Open Navi Authenticator on the phone and enter this code:\n")
         say(f"      {shown}\n")
@@ -902,17 +1097,13 @@ def approve(args, db, machine_key, root):
         raise ValueError("Approved certificate belongs to another phone key.")
 
     machine_id = digest(spki(root.public_key()))
-    request_id = secrets.token_hex(16)
+    request_bytes = secrets.token_bytes(16)
+    request_id = request_bytes.hex()
     now = int(time.time() * 1000)
-    payload = {"domain": DOMAIN, "kind": "enroll" if enrolling else "remote-setup" if setup else "authenticate",
-               "request_id": request_id, "nonce": b64(secrets.token_bytes(32)),
-               "machine_id": machine_id, "phone_key_id": key_id,
-               "certificate_sha256": digest(leaf_der), "machine_name": socket.gethostname(),
-               "operation": "Approve this phone for this computer" if enrolling
-                   else "Allow remote approvals through " + urlsplit(args.server).netloc if setup else args.operation,
-               "issued_at_ms": now, "expires_at_ms": now + TTL * 1000}
+    operation = ("Approve this phone for this computer" if enrolling
+                 else "Allow remote approvals through " + urlsplit(args.server).netloc if setup else args.operation)
     local_user = pwd.getpwuid(os.getuid()).pw_name
-    payload["context"] = {
+    context = {
         "application": "Phone Authenticator" if enrolling else args.application,
         "action_id": "enroll-phone" if enrolling else args.action_id,
         "command": "" if enrolling else args.requested_command,
@@ -923,47 +1114,43 @@ def approve(args, db, machine_key, root):
         "icon_name": "dialog-password" if enrolling else args.icon_name,
         "icon_png_base64": "" if enrolling or args.icon_file is None else b64(args.icon_file.read_bytes()),
     }
+    remote_setup = None
     if setup:
-        payload["context"].update(application="Navi remote approvals", action_id="remote-setup", command="",
-                                  target_user=local_user, icon_name="network-wireless", icon_png_base64="")
-        payload["remote_setup"] = {"server": args.server,
-                                   "machine_ecdh_spki_b64": b64(spki(setup_key.public_key()))}
-        if args.token:
-            payload["remote_setup"]["token"] = args.token
+        context.update(application="Navi remote approvals", action_id="remote-setup", command="",
+                       target_user=local_user, icon_name="network-wireless", icon_png_base64="")
+        remote_setup = pb().RemoteSetup(server=args.server, machine_ecdh_spki=spki(setup_key.public_key()),
+                                        token=args.token or "")
     if not enrolling and not setup and args.context_file:
         if args.context_file.stat().st_size > 65536:
             raise ValueError("Desktop context is too large.")
         context = json.loads(args.context_file.read_bytes())
         if not isinstance(context, dict):
             raise ValueError("Desktop context must be an object.")
-        payload["context"] = context
     if not enrolling and args.notification_only:
-        payload["context"]["mode"] = "notification-only"
-        payload["operation"] = "Verify phone approval for this desktop request"
+        context["mode"] = "notification-only"
+        operation = "Verify phone approval for this desktop request"
     if not enrolling and args.desktop_request_id:
         if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", args.desktop_request_id):
             raise ValueError("Invalid desktop request UUID.")
-        payload["context"]["desktop_request_id"] = args.desktop_request_id
-    if remote is not None or args.remote_only:
-        payload["remote"] = {"kind": "ntfy"}  # Navi may answer over ntfy, e.g. after Wi-Fi drops.
-        if getattr(phone, "route", "remote") == "remote" and payload["context"].get("icon_png_base64"):
-            # Over ntfy only the signed icon hash travels; Navi asks for the PNG if it lacks it.
-            png = unb64(payload["context"]["icon_png_base64"])
-            payload["context"]["icon_sha256"] = digest(png)
-            payload["context"]["icon_png_base64"] = ""
-            phone.set_icon(png)
-    validate_context(payload["context"])
-    if hasattr(phone, "transport"):
-        payload["transport"] = phone.transport
-    request = envelope(machine_key, payload)
-    request["machine_certificate_b64"] = b64(root.public_bytes(serialization.Encoding.DER))
-    request["phone_certificate_b64"] = b64(leaf_der)
-    check_message_size(request)
-    db.execute("INSERT INTO requests VALUES (?, ?, 'pending')", (request_id, encode(payload)))
+        context["desktop_request_id"] = args.desktop_request_id
+    remote_route = remote is not None or args.remote_only  # Navi may answer over ntfy, e.g. after Wi-Fi drops.
+    if remote_route and getattr(phone, "route", "remote") == "remote" and context.get("icon_png_base64"):
+        # Over ntfy only the signed icon hash travels; Navi asks for the PNG if it lacks it.
+        png = unb64(context["icon_png_base64"])
+        context["icon_sha256"] = digest(png)
+        context["icon_png_base64"] = ""
+        phone.set_icon(png)
+    validate_context(context)
+    kind = pb().KIND_ENROLL if enrolling else pb().KIND_REMOTE_SETUP if setup else pb().KIND_AUTHENTICATE
+    message = request_message(kind, request_bytes, machine_id, leaf_der, operation, now, now + TTL * 1000,
+                              context, transport=getattr(phone, "transport", None),
+                              remote=remote_route, remote_setup=remote_setup)
+    raw, request = request_envelope(machine_key, message, root, leaf_der)
+    db.execute("INSERT INTO requests VALUES (?, ?, 'pending')", (request_id, raw))
     db.commit()
     deadline = time.monotonic() + TTL
     try:
-        phone.write("request.json", request)
+        phone.write("request", request)
         phone.notify(request_id)
         say(f"Machine: {socket.gethostname()} · {machine_id}")
         say(f"Phone key: {key_id}")
@@ -971,23 +1158,11 @@ def approve(args, db, machine_key, root):
         say("Tap Approve on the phone and use your fingerprint. Waiting up to two minutes…")
         emit("step", step="awaiting-biometric", request_id=request_id, phone_key_id=key_id)
         while time.monotonic() < deadline:
-            response = phone.read("response.json")
-            if response and response.get("request_id") == request_id:
-                if response.get("status") != "signed":
-                    raise ValueError("Phone declined: " + str(response.get("message", "approval canceled")))
-                raw = unb64(response["payload_b64"])
-                if raw != encode(payload) or response["phone_certificate_b64"] != b64(leaf_der):
-                    raise ValueError("Response does not match the outstanding challenge and certificate.")
-                signature = unb64(response["signature_b64"])
-                signed = raw
-                if setup:
-                    # The phone signs its fresh ECDH key together with this exact setup request.
-                    phone_ecdh_der = unb64(response["phone_ecdh_spki_b64"])
-                    phone_ecdh = serialization.load_der_public_key(phone_ecdh_der)
-                    if not isinstance(phone_ecdh, ec.EllipticCurvePublicKey) or not isinstance(phone_ecdh.curve, ec.SECP256R1):
-                        raise ValueError("The phone's remote key must be P-256.")
-                    signed = raw + b"\n" + phone_ecdh_der
-                leaf.public_key().verify(signature, signed, ec.ECDSA(hashes.SHA256()))
+            response = phone.read("response")
+            if response is not None and bytes(response.request_id) == request_bytes:
+                # The phone's biometric Approval names the SHA-256 of these exact request bytes
+                # (and, for remote setup, its fresh ECDH key).
+                signature, phone_ecdh_der = verify_response(response, raw, leaf, setup)
                 validate_certificate(leaf, root)
                 if time.monotonic() >= deadline:
                     raise ValueError("Approval arrived after the challenge expired.")
@@ -998,6 +1173,7 @@ def approve(args, db, machine_key, root):
                     if changed != 1:
                         raise ValueError("Challenge was already consumed or canceled.")
                     if setup:
+                        phone_ecdh = serialization.load_der_public_key(phone_ecdh_der)
                         derived = remote_module().derive(setup_key.exchange(ec.ECDH(), phone_ecdh), request_id)
                         db.execute("INSERT OR REPLACE INTO remote VALUES (?, ?, ?, ?, ?, ?, ?)",
                                    (key_id, args.server, args.token, derived["phone_topic"], derived["computer_topic"],
@@ -1007,14 +1183,11 @@ def approve(args, db, machine_key, root):
                         db.execute("INSERT OR REPLACE INTO devices VALUES (?, ?, ?, ?)",
                                    (key_id, device["id"] if device else None,
                                     device["name"] if device else f"ADB {args.serial}", int(time.time() * 1000)))
-                receipt_payload = {"domain": DOMAIN, "kind": "receipt", "request_id": request_id,
-                                   "machine_id": machine_id, "phone_key_id": key_id,
-                                   "response_sha256": digest(signature), "status": "approved",
-                                   "verified_at_ms": int(time.time() * 1000)}
-                receipt = envelope(machine_key, receipt_payload)
-                atomic_write(STATE / "last-verification.json", encode({"request": request,
-                             "response": response, "receipt": receipt}) + b"\n")
-                phone.write("receipt.json", receipt)
+                receipt = receipt_message(machine_key, request_bytes, signature)
+                atomic_write(STATE / "last-verification.json", encode({
+                    "request": b64(wire(request)), "response": b64(wire(response)), "receipt": b64(wire(receipt)),
+                    "verified_at_ms": int(time.time() * 1000)}) + b"\n")
+                phone.write("receipt", receipt)
                 emit("step", step="receipt-sent")
                 say("ENROLLED: this machine signed and approved the phone public key." if enrolling
                     else f"REMOTE APPROVALS ENABLED through {args.server}; used when KDE Connect can't see the phone." if setup
@@ -1031,9 +1204,7 @@ def approve(args, db, machine_key, root):
             canceled = db.execute("UPDATE requests SET status='canceled' WHERE id=? AND status='pending'", (request_id,)).rowcount
         if canceled:
             try:
-                cancellation = envelope(machine_key, {"domain": DOMAIN, "kind": "cancel", "request_id": request_id,
-                    "machine_id": machine_id, "phone_key_id": key_id, "request_sha256": digest(encode(payload))})
-                phone.write("cancel.json", cancellation)
+                phone.write("cancel", cancel_message(machine_key, request_bytes, raw))
                 phone.notify(request_id, canceled=True)
             except Exception as error:
                 print(f"Cancellation delivery failed; phone request will expire: {error}", file=sys.stderr)

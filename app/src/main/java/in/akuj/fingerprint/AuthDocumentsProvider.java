@@ -96,7 +96,7 @@ public final class AuthDocumentsProvider extends DocumentsProvider {
             throw new FileNotFoundException("Choose the Navi Authenticator folder itself");
         long identity = Binder.clearCallingIdentity();
         try {
-            if (name.matches("navi-auth-(request|receipt|cancel|enroll-offer)-[a-f0-9]{32}\\.json")) {
+            if (name.matches(KdeConnectInbox.MESSAGE_NAME + "\\.pb")) {
                 File[] files = inbox.listFiles();
                 int retained = 0;
                 if (files != null) for (File file : files) {
@@ -224,14 +224,14 @@ public final class AuthDocumentsProvider extends DocumentsProvider {
                 flags = Document.FLAG_SUPPORTS_WRITE | Document.FLAG_SUPPORTS_DELETE;
             } else if (id.matches("response:[a-f0-9]{32}")) {
                 byte[] bytes = response(id);
-                name = "navi-auth-response-" + id.substring(9) + ".json"; mime = "application/json"; size = bytes.length; flags = 0;
+                name = "navi-auth-response-" + id.substring(9) + ".pb"; mime = KdeConnectInbox.MIME; size = bytes.length; flags = 0;
             } else if (id.matches("hello:[a-f0-9]{32}")) {
                 byte[] bytes = hello(id);
-                name = "navi-auth-enroll-hello-" + id.substring(6) + ".json"; mime = "application/json"; size = bytes.length; flags = 0;
+                name = "navi-auth-enroll-hello-" + id.substring(6) + ".pb"; mime = KdeConnectInbox.MIME; size = bytes.length; flags = 0;
             } else {
                 File file = incoming(id);
                 name = new String(Files.readAllBytes(new File(inbox, file.getName() + ".name").toPath()), StandardCharsets.UTF_8);
-                mime = "application/json"; size = file.length(); modified = file.lastModified();
+                mime = KdeConnectInbox.MIME; size = file.length(); modified = file.lastModified();
                 flags = Document.FLAG_SUPPORTS_WRITE | Document.FLAG_SUPPORTS_DELETE;
             }
             MatrixCursor.RowBuilder row = cursor.newRow(); String[] columns = cursor.getColumnNames();
@@ -252,15 +252,14 @@ public final class AuthDocumentsProvider extends DocumentsProvider {
     private byte[] response(String id) throws FileNotFoundException {
         try {
             Bridge bridge = new Bridge(getContext());
-            JSONObject value = bridge.read("response.json");
-            if (value == null || !id.substring(9).equals(value.optString("request_id"))) throw new FileNotFoundException("Expired approval");
-            JSONObject request = bridge.read("request.json");
+            in.akuj.fingerprint.wire.RequestEnvelope request = bridge.readRequest();
             if (request == null) throw new FileNotFoundException("No current request");
             Challenge challenge = bridge.validate(request, SigningKey.prepare(), true);
-            if (!challenge.id.equals(id.substring(9)) || !KdeConnectInbox.uses(challenge) || bridge.canceled(challenge)
-                    || challenge.payload.getLong("expires_at_ms") + 30000 < System.currentTimeMillis())
+            in.akuj.fingerprint.wire.Response value = bridge.responseFor(challenge);
+            if (value == null || !challenge.id.equals(id.substring(9)) || !KdeConnectInbox.uses(challenge) || bridge.canceled(challenge)
+                    || challenge.expiresAt + 30000 < System.currentTimeMillis())
                 throw new FileNotFoundException("Approval is no longer available");
-            return value.toString().getBytes(StandardCharsets.UTF_8);
+            return in.akuj.fingerprint.wire.Mail.newBuilder().setResponse(value).build().toByteArray();
         } catch (Exception error) { throw missing(error); }
     }
 

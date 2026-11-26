@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Signed-file transport through an already running, paired KDE Connect.
 
-The child owns D-Bus and files as the desktop user. Nothing received from that
-child is authorization: callers must verify the existing exact phone proof.
+The child owns D-Bus and files as the desktop user and only moves opaque bytes
+(protobuf Mail messages, proto/navi.proto). Nothing received from that child is
+authorization: callers must verify the existing exact phone proof.
 Importing this module does not connect to D-Bus or start a process.
 """
 
@@ -30,7 +31,7 @@ MAX_SPOOL_FILES = 96
 DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 DEVICE_PATH_ID = re.compile(r"[A-Za-z0-9_]{1,128}\Z")
 REQUEST_ID = re.compile(r"[a-f0-9]{32}\Z")
-MAIL_FILE = re.compile(r"navi-auth-(request|receipt|cancel|enroll-offer)-[a-f0-9]{32}\.json\Z")
+MAIL_FILE = re.compile(r"navi-auth-(request|receipt|cancel|enroll-offer)-[a-f0-9]{32}\.pb\Z")
 INTERPRETER = "/usr/bin/python3"
 SERVICE = "org.kde.kdeconnect"
 SHARE_INTERFACE = "org.kde.kdeconnect.device.share"
@@ -190,60 +191,73 @@ class KdeConnectPhone:
         return dict(key_id_sha256=self.phone_id,
                     public_key_spki_base64=self.crypto.b64(self.crypto.spki(self.leaf.public_key())))
 
+    def _send(self, kind, mail):
+        raw = self.crypto.wire(mail)
+        if len(raw) > MAX_FILE:
+            raise ValueError("KDE Connect message exceeds 65536 bytes")
+        self._rpc("send", filename=f"navi-auth-{kind}-{self.request_id}.pb",
+                  data_b64=base64.b64encode(raw).decode(), request_id=self.request_id)
+
+    def _received(self):
+        """The next file the phone shared for the outstanding request, as a Mail (untrusted)."""
+        value = self._rpc("read")
+        if value is None:
+            return None
+        return self.crypto.parse("Mail", base64.b64decode(value, validate=True), MAX_FILE)
+
     def send_offer(self, session_id, offer):
         """Share the machine-signed pairing offer; it is untrusted until the user types the code."""
         if self.leaf is not None or self.request_id is not None:
             raise ValueError("A pairing offer needs a fresh enrollment transport")
         if not isinstance(session_id, str) or not REQUEST_ID.fullmatch(session_id):
             raise ValueError("Invalid pairing session ID")
-        mail = {"domain": self.crypto.DOMAIN, "kind": "kdeconnect-mail", "name": "enroll-offer.json",
-                "request_id": session_id, "value": offer}
-        raw = _encode(mail)
-        if len(raw) > MAX_FILE:
-            raise ValueError("Pairing offer exceeds 65536 bytes")
         self.request_id = session_id
-        self._rpc("send", filename=f"navi-auth-enroll-offer-{session_id}.json",
-                  data_b64=base64.b64encode(raw).decode(), request_id=session_id)
+        mail = self.crypto.pb().Mail()
+        mail.offer.CopyFrom(offer)
+        self._send("enroll-offer", mail)
 
     def read_hello(self):
         if self.leaf is not None or self.request_id is None:
             raise ValueError("No pairing offer is outstanding")
-        value = self._rpc("read")
-        return value if isinstance(value, dict) and value.get("kind") == "enroll-hello" else None
+        mail = self._received()
+        return mail.hello if mail is not None and mail.WhichOneof("value") == "hello" else None
 
     def write(self, name, value):
         if self.leaf is None:
             raise ValueError("Enrollment requests require the certified phone key")
-        if name not in {"request.json", "receipt.json", "cancel.json"}:
+        if name not in {"request", "receipt", "cancel"}:
             raise ValueError("Invalid computer message name")
-        # Keep our own copy: later terminal envelopes must carry the exact request.
-        value = _object(self.crypto.encode(value))
-        if name == "request.json":
-            payload = _object(self.crypto.unb64(value["payload_b64"]))
-            request_id = payload.get("request_id")
-            if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        mail = self.crypto.pb().Mail()
+        if name == "request":
+            request = self.crypto.peek(value.signed.payload, "request")
+            request_id = bytes(request.request_id).hex()
+            if not REQUEST_ID.fullmatch(request_id):
                 raise ValueError("Invalid phone request ID")
-            if payload.get("transport") != self.transport:
+            if not request.HasField("transport") or request.transport.desktop_device_id != self.transport["desktop_device_id"]:
                 raise ValueError("The signed request must bind the KDE Connect return device")
             if self.request_id is not None:
                 raise ValueError("This KDE Connect transport already sent a request")
-            self.request_id, self._request = request_id, value
-        if self._request is None:
-            raise ValueError("A terminal message requires its original signed request")
-        mail = {"domain": self.crypto.DOMAIN, "kind": "kdeconnect-mail", "name": name,
-                "request_id": self.request_id, "value": value}
-        if name != "request.json":
-            mail["request"] = self._request
-        raw = _encode(mail)
-        if len(raw) > MAX_FILE:
-            raise ValueError("KDE Connect signed envelope exceeds 65536 bytes")
-        filename = f"navi-auth-{name[:-5]}-{self.request_id}.json"
-        self._rpc("send", filename=filename, data_b64=base64.b64encode(raw).decode(), request_id=self.request_id)
+            # Keep our own copy: later terminal messages carry the exact request (a cancel may overtake it).
+            self._request = self.crypto.pb().RequestEnvelope()
+            self._request.CopyFrom(value)
+            self.request_id = request_id
+            mail.request.CopyFrom(value)
+        else:
+            if self._request is None:
+                raise ValueError("A terminal message requires its original signed request")
+            getattr(mail, name).CopyFrom(value)
+            mail.original_request.CopyFrom(self._request)
+        self._send(name, mail)
 
     def read(self, name):
-        if name != "response.json":
+        if name != "response":
             raise ValueError("Invalid phone response name")
-        return self._rpc("read") if self.request_id is not None else None
+        if self.request_id is None:
+            return None
+        mail = self._received()
+        if mail is None or mail.WhichOneof("value") != "response" or bytes(mail.response.request_id).hex() != self.request_id:
+            return None
+        return mail.response
 
     def notify(self, request_id, canceled=False):
         pass  # Delivery to the phone's DocumentsProvider posts/withdraws the notification.
@@ -377,7 +391,7 @@ def _read_shared_file(uri, request_id):
     # This also allows KDE's collision suffix; the signed body remains authority.
     filename = os.path.basename(path)
     if not (filename.startswith(f"navi-auth-response-{request_id}")
-            or filename.startswith(f"navi-auth-enroll-hello-{request_id}")) or not filename.endswith(".json"):
+            or filename.startswith(f"navi-auth-enroll-hello-{request_id}")) or not filename.endswith(".pb"):
         return None
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
@@ -388,8 +402,8 @@ def _read_shared_file(uri, request_id):
             raw = stream.read(MAX_FILE + 1)
         if len(raw) > MAX_FILE:
             return None
-        value = _object(raw)
-        return value if value.get("request_id") == request_id else None
+        # Opaque bytes: the parent parses the protobuf Mail and checks its request ID.
+        return base64.b64encode(raw).decode("ascii")
     finally:
         os.close(fd)
 
@@ -460,12 +474,11 @@ def _worker(device_id):
             filename, request_id = value.get("filename"), value.get("request_id")
             if not isinstance(filename, str) or not MAIL_FILE.fullmatch(filename) or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
                 raise ValueError("Invalid outbound authentication filename")
-            if active["request_id"] not in (None, request_id) or not filename.endswith(request_id + ".json"):
+            if active["request_id"] not in (None, request_id) or not filename.endswith(request_id + ".pb"):
                 raise ValueError("Transport request mismatch")
             raw = base64.b64decode(value["data_b64"], validate=True)
             if not 0 < len(raw) <= MAX_FILE:
                 raise ValueError("Oversized outbound authentication file")
-            _object(raw)
             active["request_id"] = request_id
             uri = _spool_file(filename, raw)
             share.shareUrl(uri, dbus_interface=SHARE_INTERFACE, timeout=5)

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Remote approvals over an ntfy server (navi-remote/v1).
+"""Remote approvals over an ntfy server (navi-remote/v2).
 
 Used only when KDE Connect reports the phone unreachable (or delivery on the normal route
 fails). Both sides make outgoing HTTPS connections to the ntfy server: the computer publishes
 to the phone's inbox topic and reads its own inbox topic. Topic names and the message key come
 from an authenticated ECDH handshake (remote setup) and are never transmitted.
 
-Every message is DEFLATE-compressed, then AES-256-GCM encrypted, bound to its direction and
-topic. The relay sees only random topic names, timing and sizes. Nothing received here is
+Every message is a protobuf RemoteMessage (proto/navi.proto), AES-256-GCM encrypted and bound
+to its direction and topic. The relay sees only random topic names, timing and sizes. Nothing received here is
 authorization: requests stay machine-signed and responses phone-signed, and callers verify
 them exactly as for the other routes.
 
@@ -28,18 +28,17 @@ import subprocess
 import sys
 import threading
 import time
-import zlib
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 
-PROTOCOL = "navi-remote/v1"
+PROTOCOL = "navi-remote/v2"  # message AAD; key and topic derivation keep their v1 labels
 INTERPRETER = "/usr/bin/python3"
 DEFAULT_SERVER = "https://ntfy.sh"
 TO_PHONE = "to-phone"
 TO_COMPUTER = "to-computer"
 INLINE_LIMIT = 3800          # ntfy message bodies above 4096 bytes become attachments
-MAX_PLAIN = 65536            # inflated message cap
+MAX_PLAIN = 65536            # plaintext message cap
 MAX_BLOB = 98304             # encrypted message / attachment cap
 MAX_LINE = 262144            # one JSON line from the ntfy stream or the worker
 RPC_SECONDS = 15
@@ -76,7 +75,10 @@ def topic_name(material):
 
 
 def derive(shared_secret, setup_request_id):
-    """Message key and both inbox topics from the setup ECDH secret; never transmitted."""
+    """Message key and both inbox topics from the setup ECDH secret; never transmitted.
+
+    The labels stay "navi-remote/v1 ..." so remote approvals set up before protocol v2 keep
+    their key and topics."""
     salt = setup_request_id.encode("ascii")
     return dict(key=hkdf(shared_secret, salt, b"navi-remote/v1 key", 32),
                 phone_topic=topic_name(hkdf(shared_secret, salt, b"navi-remote/v1 phone-inbox", 16)),
@@ -87,37 +89,21 @@ def aad(direction, topic):
     return f"{PROTOCOL}\n{direction}\n{topic}".encode("ascii")
 
 
-def _unique(pairs):
-    result = {}
-    for name, value in pairs:
-        if name in result:
-            raise ValueError("Duplicate remote message field")
-        result[name] = value
-    return result
-
-
-def seal(key, direction, topic, value):
+def seal(key, direction, topic, plain):
+    """nonce || AES-256-GCM(serialized RemoteMessage)."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    plain = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    if len(plain) > MAX_PLAIN:
+    if not isinstance(plain, bytes) or len(plain) > MAX_PLAIN:
         raise ValueError("Remote message is too large")
     nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, zlib.compress(plain, 9), aad(direction, topic))
+    return nonce + AESGCM(key).encrypt(nonce, plain, aad(direction, topic))
 
 
 def open_sealed(key, direction, topic, blob):
+    """The plaintext RemoteMessage bytes; the caller parses them."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    if not 12 + 16 <= len(blob) <= MAX_BLOB:
+    if not 12 + 16 <= len(blob) <= min(MAX_BLOB, MAX_PLAIN + 12 + 16):
         raise ValueError("Invalid remote message size")
-    compressed = AESGCM(key).decrypt(blob[:12], blob[12:], aad(direction, topic))
-    inflater = zlib.decompressobj()
-    plain = inflater.decompress(compressed, MAX_PLAIN + 1)
-    if len(plain) > MAX_PLAIN or inflater.unconsumed_tail or not inflater.eof:
-        raise ValueError("Remote message inflates beyond its limit")
-    value = json.loads(plain, object_pairs_hook=_unique)
-    if not isinstance(value, dict):
-        raise ValueError("Invalid remote message")
-    return value
+    return AESGCM(key).decrypt(blob[:12], blob[12:], aad(direction, topic))
 
 
 def validate_server(url):
@@ -345,8 +331,8 @@ class RemoteChannel:
                 detail = f" ({self.last_error})" if self.last_error else ""
                 raise ConnectionError(f"The ntfy server {self.config['server']} is not reachable{detail}")
 
-    def publish(self, value):
-        blob = seal(self.config["key"], self.send_direction, self.send_topic, value)
+    def publish(self, plain):
+        blob = seal(self.config["key"], self.send_direction, self.send_topic, plain)
         text = b64url(blob)
         command = {"topic": self.send_topic}
         if len(text) <= INLINE_LIMIT:
@@ -424,60 +410,50 @@ class RemotePhone:
     def set_icon(self, png):
         """The PNG whose hash the signed request carries; sent only when Navi asks for it."""
         self.icon_png = png or None
-        self.icon_sha256 = hashlib.sha256(png).hexdigest() if png else None
+        self.icon_sha256 = hashlib.sha256(png).digest() if png else None
 
     def adopt_request(self, value):
         self.request = value
-        self.raw = self.crypto.unb64(value["payload_b64"])
-        self.request_id = json.loads(self.raw)["request_id"]
+        self.raw = bytes(value.signed.payload)
+        self.request_id = bytes(self.crypto.peek(self.raw, "request").request_id)
 
     def write(self, name, value):
         channel = self._channel()
-        if name == "request.json":
+        message = self.crypto.pb().RemoteMessage()
+        if name == "request":
+            # The same RequestEnvelope as on the other routes, unchanged.
             self.adopt_request(value)
-            if not self.raw.isascii():
-                raise ValueError("Signed payload must be canonical ASCII JSON")
-            message = {"name": name, "request_id": self.request_id,
-                       "value": {"payload_json": self.raw.decode("ascii"), "signature_b64": value["signature_b64"],
-                                 "machine_certificate_b64": value["machine_certificate_b64"],
-                                 "phone_certificate_b64": value["phone_certificate_b64"]}}
-        elif name in ("receipt.json", "cancel.json"):
+        elif name in ("receipt", "cancel"):
+            # Navi matches these to the request it holds by request ID, then verifies them.
             if self.raw is None:
                 raise ValueError("A terminal message requires its original signed request")
-            # By reference: Navi already holds the request it is answering.
-            message = {"name": name, "request_id": self.request_id, "value": value,
-                       "request_sha256": self.crypto.digest(self.raw)}
         else:
             raise ValueError("Invalid computer message name")
-        channel.publish(message)
+        getattr(message, name).CopyFrom(value)
+        channel.publish(self.crypto.wire(message))
 
     def read(self, name):
-        if name != "response.json":
+        if name != "response":
             raise ValueError("Invalid phone response name")
-        for message in self._channel().drain():
-            if message.get("request_id") != self.request_id:
+        for plain in self._channel().drain():
+            try:
+                message = self.crypto.parse("RemoteMessage", plain, MAX_PLAIN)
+            except ValueError:
                 continue
-            if message.get("name") == "icon-request":
-                if (self.icon_png and message.get("icon_sha256") == self.icon_sha256 and self.icons_sent < 2):
+            kind = message.WhichOneof("body")
+            if kind == "icon_request":
+                ask = message.icon_request
+                if (bytes(ask.request_id) == self.request_id and self.icon_png
+                        and bytes(ask.icon_sha256) == self.icon_sha256 and self.icons_sent < 2):
                     self.icons_sent += 1
+                    reply = self.crypto.pb().RemoteMessage()
+                    reply.icon.request_id, reply.icon.png = self.request_id, self.icon_png
                     try:
-                        self.channel.publish({"name": "icon", "request_id": self.request_id,
-                                              "icon_png_base64": self.crypto.b64(self.icon_png)})
+                        self.channel.publish(self.crypto.wire(reply))
                     except Exception:
                         pass  # Optional: Navi keeps its default icon.
-            elif message.get("name") == "response.json" and self.response is None:
-                status = message.get("status")
-                if status == "signed":
-                    response = {"request_id": self.request_id, "status": "signed",
-                                "payload_b64": self.crypto.b64(self.raw),
-                                "signature_b64": message.get("signature_b64"),
-                                "phone_certificate_b64": self.request["phone_certificate_b64"]}
-                    if "phone_ecdh_spki_b64" in message:
-                        response["phone_ecdh_spki_b64"] = message["phone_ecdh_spki_b64"]
-                    self.response = response
-                elif status == "declined":
-                    self.response = {"request_id": self.request_id, "status": "declined",
-                                     "message": str(message.get("message", ""))[:200]}
+            elif kind == "response" and self.response is None and bytes(message.response.request_id) == self.request_id:
+                self.response = message.response
         return self.response
 
     def notify(self, request_id, canceled=False):
@@ -559,7 +535,7 @@ class RoutedPhone:
             self.remote.set_icon(png)
 
     def write(self, name, value):
-        if name == "request.json":
+        if name == "request":
             self._request = value
         if self.route != "remote":
             try:

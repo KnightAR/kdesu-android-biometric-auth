@@ -6,6 +6,13 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
+import com.google.protobuf.ByteString;
+import in.akuj.fingerprint.wire.EnrollHello;
+import in.akuj.fingerprint.wire.EnrollOffer;
+import in.akuj.fingerprint.wire.HelloEnvelope;
+import in.akuj.fingerprint.wire.Mail;
+import in.akuj.fingerprint.wire.OfferEnvelope;
+import in.akuj.fingerprint.wire.Payload;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.cert.X509Certificate;
@@ -25,7 +32,9 @@ import org.json.JSONObject;
  */
 final class PairingCode {
     static final String FILE = "pending-enrollment.json";
-    static final String HELLO = "enroll-hello.json";
+    /** The tagged hello (a serialized Mail) served to KDE Connect. */
+    static final String HELLO = "enroll-hello.pb";
+    static final String OFFER_LABEL = "navi-enroll-offer/v2", HELLO_LABEL = "navi-enroll-hello/v2";
     static final int NOTIFICATION_ID = 2;
     private static final String ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford base32
     private static final long MAX_LIFETIME_MS = 10 * 60_000L;
@@ -58,40 +67,35 @@ final class PairingCode {
 
     /**
      * Checks an offer's machine signature, certificate, fields and lifetime without storing it.
-     * Returns the signed payload; "machine_id" is the verified certificate's key hash.
+     * Returns the signed offer; its machine_id is the verified certificate's key hash.
      */
-    static JSONObject validateOffer(JSONObject offer) throws Exception {
-        byte[] bytes = Bridge.decode(offer.getString("payload_b64"));
-        JSONObject payload = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-        X509Certificate machine = Bridge.certificate(offer.getString("machine_certificate_b64"));
+    static EnrollOffer validateOffer(OfferEnvelope offer) throws Exception {
+        X509Certificate machine = Bridge.certificate(offer.getMachineCertificate().toByteArray());
         Bridge.validateCertificate(machine, machine, true);
-        Bridge.verifyEnvelope(offer, machine);
+        EnrollOffer payload = Wire.open(offer.getSigned(), machine.getPublicKey(), Payload.BodyCase.ENROLL_OFFER).getEnrollOffer();
         String machineId = Bridge.hash(machine.getPublicKey().getEncoded());
-        String session = payload.getString("session_id");
-        String name = payload.getString("machine_name");
-        String desktop = payload.getString("desktop_device_id");
+        String name = payload.getMachineName();
         long now = System.currentTimeMillis();
-        long issued = payload.getLong("issued_at_ms");
-        long expires = payload.getLong("expires_at_ms");
-        if (!Challenge.DOMAIN.equals(payload.getString("domain")) || !"enroll-offer".equals(payload.getString("kind"))
-                || !session.matches("[a-f0-9]{32}") || !machineId.equals(payload.getString("machine_id"))
-                || !desktop.matches("[A-Za-z0-9_-]{1,128}") || name.isEmpty() || name.length() > 128
+        long issued = payload.getIssuedAtMs();
+        long expires = payload.getExpiresAtMs();
+        if (payload.getSessionId().size() != 16 || !machineId.equals(Wire.hex(payload.getMachineId()))
+                || !payload.getDesktopDeviceId().matches("[A-Za-z0-9_-]{1,128}") || name.isEmpty() || name.length() > 128
                 || name.matches("(?s).*[\\x00-\\x1f\\u202a-\\u202e\\u2066-\\u2069].*")
                 || issued > now + CLOCK_SKEW_MS || expires <= now || expires - issued > MAX_LIFETIME_MS
-                || Bridge.decode(offer.getString("code_tag_b64")).length != 32)
+                || offer.getCodeTag().size() != 32)
             throw new IllegalArgumentException("Invalid computer pairing offer.");
         return payload;
     }
 
     /** Called for a KDE Connect delivery; validates the machine signature before storing. */
-    static void receiveOffer(Context context, JSONObject offer) throws Exception {
-        JSONObject payload = validateOffer(offer);
-        String machineId = payload.getString("machine_id");
-        String session = payload.getString("session_id");
-        String name = payload.getString("machine_name");
-        String desktop = payload.getString("desktop_device_id");
+    static void receiveOffer(Context context, OfferEnvelope offer) throws Exception {
+        EnrollOffer payload = validateOffer(offer);
+        String machineId = Wire.hex(payload.getMachineId());
+        String session = Wire.hex(payload.getSessionId());
+        String name = payload.getMachineName();
+        String desktop = payload.getDesktopDeviceId();
         long now = System.currentTimeMillis();
-        long expires = payload.getLong("expires_at_ms");
+        long expires = payload.getExpiresAtMs();
         synchronized (Bridge.MAILBOX) {
             Bridge bridge = new Bridge(context);
             JSONObject state = load(bridge);
@@ -104,9 +108,7 @@ final class PairingCode {
             while (offers.length() >= MAX_OFFERS) offers.remove(0);
             offers.put(new JSONObject().put("session_id", session).put("machine_id", machineId)
                     .put("machine_name", name).put("desktop_device_id", desktop)
-                    .put("machine_certificate_b64", offer.getString("machine_certificate_b64"))
-                    .put("payload_b64", offer.getString("payload_b64"))
-                    .put("code_tag_b64", offer.getString("code_tag_b64"))
+                    .put("offer_b64", Bridge.encode(offer.toByteArray()))
                     .put("expires_at_ms", expires).put("attempts", 0));
             state.put("offers", offers);
             bridge.write(FILE, state);
@@ -149,8 +151,9 @@ final class PairingCode {
             for (int i = 0; i < offers.length(); i++) {
                 JSONObject offer = offers.getJSONObject(i);
                 if (offer.getLong("expires_at_ms") <= now) continue;
-                byte[] expected = Bridge.decode(offer.getString("code_tag_b64"));
-                byte[] actual = tag(code, "navi-enroll-offer/v1", Bridge.decode(offer.getString("payload_b64")));
+                OfferEnvelope stored = Wire.parse(OfferEnvelope::parseFrom, Bridge.decode(offer.getString("offer_b64")), Wire.MAX_MESSAGE);
+                byte[] expected = stored.getCodeTag().toByteArray();
+                byte[] actual = tag(code, OFFER_LABEL, stored.getSigned().getPayload().toByteArray());
                 if (match == null && MessageDigest.isEqual(expected, actual)) match = offer;
                 else {
                     offer.put("attempts", offer.getInt("attempts") + 1);
@@ -165,14 +168,13 @@ final class PairingCode {
                         : "Code does not match. Check the code on the computer and try again.");
             }
             String session = match.getString("session_id");
-            JSONObject hello = new JSONObject().put("domain", Challenge.DOMAIN).put("kind", "enroll-hello")
-                    .put("session_id", session).put("machine_id", match.getString("machine_id"))
-                    .put("phone_key_id", key.id).put("public_key_spki_base64", key.publicKeyBase64())
-                    .put("issued_at_ms", now);
-            byte[] helloBytes = hello.toString().getBytes(StandardCharsets.UTF_8);
-            bridge.write(HELLO, new JSONObject().put("request_id", session).put("kind", "enroll-hello")
-                    .put("payload_b64", Bridge.encode(helloBytes))
-                    .put("code_tag_b64", Bridge.encode(tag(code, "navi-enroll-hello/v1", helloBytes))));
+            byte[] helloBytes = Wire.payload(Payload.newBuilder().setEnrollHello(EnrollHello.newBuilder()
+                    .setSessionId(Wire.unhex(session)).setMachineId(Wire.unhex(match.getString("machine_id")))
+                    .setPhoneKeyId(Wire.unhex(key.id)).setPublicKeySpki(ByteString.copyFrom(key.publicKey.getEncoded()))
+                    .setIssuedAtMs(now)));
+            bridge.write(HELLO, Mail.newBuilder().setHello(HelloEnvelope.newBuilder()
+                    .setPayload(ByteString.copyFrom(helloBytes))
+                    .setCodeTag(ByteString.copyFrom(tag(code, HELLO_LABEL, helloBytes)))).build());
             JSONObject verified = new JSONObject().put("session_id", session)
                     .put("machine_id", match.getString("machine_id")).put("machine_name", match.getString("machine_name"))
                     .put("desktop_device_id", match.getString("desktop_device_id"))
@@ -187,11 +189,13 @@ final class PairingCode {
     /** Snapshot of the hello document for the KDE Connect transfer, while it is still current. */
     static byte[] helloBytes(Bridge bridge, String session) throws Exception {
         JSONObject verified = verified(bridge);
-        JSONObject hello = bridge.read(HELLO);
-        if (verified == null || hello == null || !session.equals(verified.getString("session_id"))
-                || !session.equals(hello.optString("request_id")))
+        byte[] bytes = bridge.readBytes(HELLO);
+        if (verified == null || bytes == null || !session.equals(verified.getString("session_id")))
             throw new IllegalStateException("Pairing code is no longer current");
-        return hello.toString().getBytes(StandardCharsets.UTF_8);
+        Mail hello = Wire.parse(Mail::parseFrom, bytes, Wire.MAX_MESSAGE);
+        EnrollHello value = Wire.peek(hello.getHello().getPayload().toByteArray(), Payload.BodyCase.ENROLL_HELLO).getEnrollHello();
+        if (!session.equals(Wire.hex(value.getSessionId()))) throw new IllegalStateException("Pairing code is no longer current");
+        return bytes;
     }
 
     static void clear(Bridge bridge) throws Exception {
@@ -202,7 +206,11 @@ final class PairingCode {
     private static JSONObject load(Bridge bridge) throws Exception {
         JSONObject state = bridge.read(FILE);
         if (state == null) state = new JSONObject();
-        if (state.optJSONArray("offers") == null) state.put("offers", new JSONArray());
+        JSONArray offers = state.optJSONArray("offers"), current = new JSONArray();
+        // Offers saved by the previous (JSON) protocol cannot match a code any more; drop them.
+        if (offers != null) for (int i = 0; i < offers.length(); i++)
+            if (offers.getJSONObject(i).has("offer_b64")) current.put(offers.getJSONObject(i));
+        state.put("offers", current);
         return state;
     }
 

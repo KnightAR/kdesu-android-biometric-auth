@@ -3,7 +3,6 @@ package in.akuj.fingerprint;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import org.json.JSONObject;
 
 /** Decode only bounded thumbnails from the already verified signed context. */
 final class RequesterIcon {
@@ -11,16 +10,15 @@ final class RequesterIcon {
      * The inline icon (cached by hash for later ntfy requests), or, for a request that carries only
      * {@code icon_sha256}, the cached icon with that hash. Null means: show the default icon.
      */
-    static Bitmap decode(Context context, JSONObject request) {
-        String encoded = request.optString("icon_png_base64");
+    static Bitmap decode(Context context, in.akuj.fingerprint.wire.Context request) {
         byte[] bytes;
-        if (!encoded.isEmpty()) {
-            if (encoded.length() > 22000) throw new IllegalArgumentException("Requester icon is too large.");
-            bytes = Bridge.decode(encoded);
+        if (!request.getIconPng().isEmpty()) {
+            bytes = request.getIconPng().toByteArray();
             check(bytes);
             try { IconCache.put(context, Bridge.hash(bytes), bytes); } catch (Exception ignored) { }
         } else {
-            bytes = IconCache.get(context, request.optString("icon_sha256"));
+            if (request.getIconSha256().isEmpty()) return null;
+            bytes = IconCache.get(context, Wire.hex(request.getIconSha256()));
             if (bytes == null) return null;
         }
         Bitmap result = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);

@@ -17,11 +17,17 @@ import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.security.auth.x500.X500Principal;
-import org.json.JSONObject;
+import com.google.protobuf.ByteString;
+import in.akuj.fingerprint.wire.Payload;
+import in.akuj.fingerprint.wire.Signed;
 
 /** Transport key only. It cannot sign biometric command approvals. */
 final class NetworkIdentity {
     static final String TLS_PROTOCOL = Build.VERSION.SDK_INT >= 29 ? "TLSv1.3" : "TLSv1.2";
+    /** The biometric-signed Payload{network_identity} binding this TLS certificate to the phone key. */
+    static final String FILE = "network-identity.pb";
+    /** SharedPreferences "network": set when an update turned direct network approvals off. */
+    static final String REENABLE = "reenable_needed";
     private static final String ALIAS = "phone-authenticator.network-tls.v1";
     final X509Certificate certificate;
     private final PrivateKey privateKey;
@@ -52,21 +58,24 @@ final class NetworkIdentity {
         privateKey = (PrivateKey) store.getKey(ALIAS, null);
     }
 
-    JSONObject statement(SigningKey key) throws Exception {
-        return new JSONObject().put("domain", Challenge.DOMAIN).put("kind", "network-identity")
-                .put("phone_key_id", key.id).put("tls_certificate_b64", Bridge.encode(certificate.getEncoded()));
+    /** The exact bytes the biometric key signs to bind this TLS certificate. */
+    byte[] statement(SigningKey key) throws Exception {
+        return Wire.payload(Payload.newBuilder().setNetworkIdentity(in.akuj.fingerprint.wire.NetworkIdentity.newBuilder()
+                .setPhoneKeyId(Wire.unhex(key.id)).setTlsCertificate(ByteString.copyFrom(certificate.getEncoded()))));
     }
 
-    boolean approved(Bridge bridge, SigningKey key) throws Exception {
-        JSONObject value = bridge.read("network-identity.json");
-        if (value == null) return false;
-        byte[] payload = Bridge.decode(value.getString("payload_b64"));
-        JSONObject statement = new JSONObject(new String(payload, java.nio.charset.StandardCharsets.UTF_8));
-        return key.verify(payload, Bridge.decode(value.getString("signature_b64")))
-                && Challenge.DOMAIN.equals(statement.getString("domain"))
-                && "network-identity".equals(statement.getString("kind"))
-                && key.id.equals(statement.getString("phone_key_id"))
-                && java.util.Arrays.equals(certificate.getEncoded(), Bridge.decode(statement.getString("tls_certificate_b64")));
+    /** The stored binding, when it is a valid statement by this phone's key about this certificate. */
+    Signed approved(Bridge bridge, SigningKey key) throws Exception {
+        Signed value = bridge.readSigned(FILE);
+        if (value == null) return null;
+        try {
+            in.akuj.fingerprint.wire.NetworkIdentity statement =
+                    Wire.open(value, key.publicKey, Payload.BodyCase.NETWORK_IDENTITY).getNetworkIdentity();
+            return key.id.equals(Wire.hex(statement.getPhoneKeyId()))
+                    && java.util.Arrays.equals(certificate.getEncoded(), statement.getTlsCertificate().toByteArray()) ? value : null;
+        } catch (IllegalArgumentException invalid) {
+            return null;
+        }
     }
 
     SSLContext context() throws Exception {

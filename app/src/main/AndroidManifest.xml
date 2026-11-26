@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="in.akuj.fingerprint"
-    android:versionCode="17"
-    android:versionName="0.11.0">
+    android:versionCode="18"
+    android:versionName="0.12.0">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" android:maxSdkVersion="29" />
@@ -49,16 +49,16 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="content" />
-                <data android:mimeType="application/json" />
-                <data android:mimeType="text/plain" />
                 <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/x-protobuf" />
+                <data android:mimeType="application/vnd.google.protobuf" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="application/json" />
-                <data android:mimeType="text/plain" />
                 <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/x-protobuf" />
+                <data android:mimeType="application/vnd.google.protobuf" />
             </intent-filter>
         </activity>
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">

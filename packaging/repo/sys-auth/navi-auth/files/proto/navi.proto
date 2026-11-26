@@ -1,0 +1,291 @@
+// Navi Authenticator wire format (desktop <-> phone), protocol v2.
+//
+// This file is the single source of truth for every message between the computer and Navi.
+// The desktop generates navi_pb2.py from it (make), Navi generates Java lite classes (build.sh).
+//
+// Rules for changing it (see CONTRIBUTING.md):
+// - Signatures cover the exact serialized bytes received. Nobody re-serializes a received
+//   message to verify it, so no canonical encoding is needed.
+// - Never renumber or reuse a field number. Retire fields with `reserved`.
+// - Fields 1-15 cost one tag byte, 16+ cost two: keep 1-15 for fields every request sends.
+// - Unknown fields are ignored by protobuf. Any change that alters security meaning (a new
+//   constraint the phone must honour, a different binding) must bump Protocol, so an older
+//   peer fails closed instead of silently ignoring it.
+// - In Request, the random request_id and nonce stay first (fields 2 and 3): the signer's
+//   fresh randomness precedes any caller-supplied text, which rules out chosen-prefix
+//   hash collisions against the signed bytes.
+// - No map fields: repeated messages keep the encoding simple and ordered.
+syntax = "proto3";
+
+package navi.v2;
+
+option java_package = "in.akuj.fingerprint.wire";
+option java_multiple_files = true;
+option optimize_for = LITE_RUNTIME;
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_NAVI_V2 = 2;
+}
+
+// Exact signed bytes: payload is a serialized Payload; signature is DER ECDSA P-256/SHA-256
+// over payload.
+message Signed {
+  bytes payload = 1;
+  bytes signature = 2;
+}
+
+// Everything any key signs. The oneof case types the bytes, so one kind of signed message can
+// never be accepted as another.
+message Payload {
+  Protocol protocol = 1;
+  oneof body {
+    EnrollOffer enroll_offer = 2;     // machine key
+    EnrollHello enroll_hello = 3;     // unsigned; tagged with the pairing code (HelloEnvelope)
+    Request request = 4;              // machine key
+    Approval approval = 5;            // phone biometric key
+    Receipt receipt = 6;              // machine key
+    Cancel cancel = 7;                // machine key
+    NetworkIdentity network_identity = 8;  // phone biometric key
+    NetworkRpc network_rpc = 9;       // machine key
+  }
+}
+
+// --- Code enrollment -------------------------------------------------------------------
+
+message EnrollOffer {
+  bytes session_id = 1;          // 16 random bytes
+  bytes machine_id = 2;          // SHA-256 of the machine SPKI
+  string machine_name = 3;
+  string desktop_device_id = 4;  // the computer's KDE Connect ID
+  uint64 issued_at_ms = 5;
+  uint64 expires_at_ms = 6;
+}
+
+// code_tag = HMAC-SHA256(code, "navi-enroll-offer/v2\n" || signed.payload)
+message OfferEnvelope {
+  Signed signed = 1;
+  bytes machine_certificate = 2;  // DER, self-signed CA
+  bytes code_tag = 3;
+}
+
+message EnrollHello {
+  bytes session_id = 1;
+  bytes machine_id = 2;
+  bytes phone_key_id = 3;     // SHA-256 of public_key_spki
+  bytes public_key_spki = 4;  // DER SubjectPublicKeyInfo of the biometric key
+  uint64 issued_at_ms = 5;
+}
+
+// payload is a serialized Payload{enroll_hello};
+// code_tag = HMAC-SHA256(code, "navi-enroll-hello/v2\n" || payload)
+message HelloEnvelope {
+  bytes payload = 1;
+  bytes code_tag = 2;
+}
+
+// --- Requests --------------------------------------------------------------------------
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_ENROLL = 1;
+  KIND_AUTHENTICATE = 2;
+  KIND_REMOTE_SETUP = 3;
+}
+
+message Request {
+  Kind kind = 1;
+  bytes request_id = 2;          // 16 random bytes; keep first (see header)
+  bytes nonce = 3;               // 32 random bytes
+  bytes machine_id = 4;          // SHA-256 of the machine SPKI; Navi's pairing lookup key
+  bytes certificate_sha256 = 5;  // SHA-256 of the approved phone certificate (binds the phone key)
+  string machine_name = 6;
+  string operation = 7;
+  uint64 issued_at_ms = 8;
+  uint64 expires_at_ms = 9;
+  Context context = 10;
+  Execution execution = 11;          // privileged execution only
+  KdeConnectRoute transport = 12;    // present only when the request travels through KDE Connect
+  RemoteRoute remote = 13;           // present when Navi may answer over ntfy
+  RemoteSetup remote_setup = 14;     // KIND_REMOTE_SETUP only
+  reserved 15;                       // formerly phone_key_id (bound by certificate_sha256)
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_EXECUTE = 1;
+  MODE_NOTIFICATION_ONLY = 2;
+}
+
+// Display context. Fields every kdesu request carries use 1-15.
+message Context {
+  string application = 1;
+  string action_id = 2;
+  string command = 3;            // the one copy of the command: shown, and exactly what runs
+  string requesting_user = 4;
+  string target_user = 5;
+  string source = 6;
+  string icon_name = 7;
+  optional uint32 requesting_uid = 8;
+  Mode mode = 9;
+  bytes icon_sha256 = 10;        // 32 bytes; the PNG travels separately (ntfy)
+  bytes icon_png = 11;           // at most 16 KiB, 256x256
+  bytes desktop_request_id = 12; // 16-byte UUID of the kdesu dialog
+  uint32 requester_pid = 13;
+  string requester_executable = 14;
+  // 15 is kept for a per-request field such as the sudo terminal.
+  bool command_hidden = 16;
+}
+
+message EnvVar {
+  string name = 1;
+  string value = 2;
+}
+
+message Execution {
+  string shell = 1;   // "/bin/sh -c"
+  uint32 uid = 2;
+  uint32 gid = 3;
+  string cwd = 4;
+  uint64 cwd_device = 5;
+  uint64 cwd_inode = 6;
+  repeated EnvVar environment = 7;
+}
+
+message KdeConnectRoute {
+  string desktop_device_id = 1;
+}
+
+message RemoteRoute {
+}
+
+message RemoteSetup {
+  string server = 1;
+  bytes machine_ecdh_spki = 2;  // DER P-256 SPKI of the computer's ephemeral key
+  string token = 3;
+}
+
+// Certificates only on KIND_ENROLL; every other request names them by machine_id and
+// certificate_sha256, and Navi uses the certificates stored at pairing.
+message RequestEnvelope {
+  Signed signed = 1;
+  bytes machine_certificate = 2;
+  bytes phone_certificate = 3;
+}
+
+// --- Replies and terminal messages ----------------------------------------------------
+
+// What the biometric key signs: the phone's own statement about the exact request bytes.
+message Approval {
+  bytes request_sha256 = 1;   // SHA-256 of the exact Request payload bytes
+  bytes phone_ecdh_spki = 2;  // KIND_REMOTE_SETUP only: the phone's ephemeral P-256 SPKI
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_SIGNED = 1;
+  STATUS_DECLINED = 2;
+}
+
+message Response {
+  bytes request_id = 1;
+  Status status = 2;
+  Signed approval = 3;  // STATUS_SIGNED: Payload{approval}
+  string message = 4;   // STATUS_DECLINED
+}
+
+enum ReceiptStatus {
+  RECEIPT_STATUS_UNSPECIFIED = 0;
+  RECEIPT_APPROVED = 1;
+}
+
+message Receipt {
+  bytes request_id = 1;
+  bytes response_sha256 = 2;  // SHA-256 of the approval signature
+  ReceiptStatus status = 3;
+  uint32 execution_pid = 4;   // > 0 for MODE_EXECUTE
+}
+
+message Cancel {
+  bytes request_id = 1;
+  bytes request_sha256 = 2;   // SHA-256 of the exact Request payload bytes
+}
+
+// --- Transports ------------------------------------------------------------------------
+
+// Binds Navi's direct-network TLS certificate to its biometric key.
+message NetworkIdentity {
+  bytes phone_key_id = 1;
+  bytes tls_certificate = 2;  // DER
+}
+
+// First frame on a direct-network connection (phone -> computer).
+message NetworkHello {
+  Signed identity = 1;  // Payload{network_identity}, biometric key
+  bytes nonce = 2;      // 32 fresh bytes for this connection
+}
+
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_READ = 1;
+  OP_WRITE = 2;
+}
+
+enum MailName {
+  MAIL_NAME_UNSPECIFIED = 0;
+  MAIL_REQUEST = 1;
+  MAIL_RESPONSE = 2;
+  MAIL_RECEIPT = 3;
+  MAIL_CANCEL = 4;
+}
+
+// One machine-signed call per connection, bound to that connection's nonce.
+message NetworkRpc {
+  bytes machine_id = 1;
+  bytes server_nonce = 2;
+  Op operation = 3;
+  MailName name = 4;
+  bytes request_id = 5;
+  Mail value = 6;  // OP_WRITE only
+}
+
+message NetworkReply {
+  bool ok = 1;
+  Mail value = 2;  // OP_READ: the response, when there is one
+}
+
+// A KDE Connect file, or the value of a direct-network call.
+message Mail {
+  oneof value {
+    RequestEnvelope request = 1;
+    Signed receipt = 2;           // Payload{receipt}
+    Signed cancel = 3;            // Payload{cancel}
+    Response response = 4;
+    OfferEnvelope offer = 5;
+    HelloEnvelope hello = 6;
+  }
+  // KDE Connect receipts and cancels carry the request they end: a cancel may overtake it.
+  RequestEnvelope original_request = 7;
+}
+
+// The plaintext of one ntfy message (AES-256-GCM, AAD "navi-remote/v2\n<direction>\n<topic>").
+message RemoteMessage {
+  oneof body {
+    RequestEnvelope request = 1;
+    Signed receipt = 2;
+    Signed cancel = 3;
+    Response response = 4;
+    IconRequest icon_request = 5;
+    Icon icon = 6;
+  }
+}
+
+message IconRequest {
+  bytes request_id = 1;
+  bytes icon_sha256 = 2;
+}
+
+message Icon {
+  bytes request_id = 1;
+  bytes png = 2;
+}

@@ -83,7 +83,7 @@ Kirigami.Dialog {
             text: i18n("No code box in Navi? KDE Connect isn't delivering to Navi yet. On the phone open Navi → <b>☰</b> → "
                      + "<b>Settings</b> → <b>Set up KDE Connect</b>, then Cancel here and press <b>Enroll</b> again. "
                      + "(Opening <tt>%1</tt> from Downloads with Navi shows the same steps.)",
-                       kcm.offerFile.length > 0 ? kcm.offerFile : "navi-auth-enroll-offer-….json")
+                       kcm.offerFile.length > 0 ? kcm.offerFile : "navi-auth-enroll-offer-….pb")
         }
         QQC2.BusyIndicator {
             Layout.alignment: Qt.AlignHCenter

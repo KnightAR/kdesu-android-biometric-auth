@@ -29,9 +29,11 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.PopupMenu;
 import android.widget.TextView;
+import in.akuj.fingerprint.wire.RequestEnvelope;
+import in.akuj.fingerprint.wire.Response;
+import in.akuj.fingerprint.wire.Signed;
 import org.json.JSONObject;
 import java.security.Signature;
-import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -54,10 +56,10 @@ public final class MainActivity extends Activity {
     private Bridge bridge;
     private SigningKey key;
     private Challenge pending, awaiting;
-    private JSONObject signedResponse;
+    private Response signedResponse;
     private Attempt active;
     private String seenEnvelope, proofText, openedRequestId, iconPending;
-    private boolean stopped = true, resumed, busy, ready;
+    private boolean stopped = true, resumed, busy, ready, reenableOffered;
     // Command display (display only; the signed command is never changed).
     private static final int COLLAPSE_CHARS = 512, COLLAPSE_ROWS = 12, PROMPT_CHARS = 200;
     private String shownCommandId, shownCommand = "";
@@ -145,6 +147,28 @@ public final class MainActivity extends Activity {
         pairingOpen.setOnClickListener(v -> startActivity(new Intent(this, PairedComputersActivity.class)));
     }
 
+    /**
+     * After an update replaced the direct network binding format, direct network approvals are off until
+     * the user signs a new binding (one fingerprint). Offered once per launch until done or dismissed.
+     */
+    private void offerNetworkReenable() {
+        SharedPreferences network = getSharedPreferences("network", 0);
+        if (reenableOffered || !network.getBoolean(NetworkIdentity.REENABLE, false)) return;
+        reenableOffered = true;
+        new AlertDialog.Builder(this)
+                .setTitle("Turn direct network approvals on again?")
+                .setMessage("This update changed how Navi proves its network connection to your computers, so direct "
+                        + "network approvals were turned off. Your pairings are kept, and requests still arrive through "
+                        + "KDE Connect (and ntfy, if set up). Turning them on again takes one fingerprint.")
+                .setNegativeButton("Not now", (dialog, which) -> {
+                    network.edit().remove(NetworkIdentity.REENABLE).apply();
+                    NetworkService.cancelReenableNotification(this);
+                })
+                .setPositiveButton("Turn on again", (dialog, which) -> startActivityForResult(
+                        new Intent(this, SettingsActivity.class).putExtra(SettingsActivity.EXTRA_ENABLE_NETWORK, true), SETTINGS))
+                .show();
+    }
+
     private void showMenu(View anchor) {
         PopupMenu menu = new PopupMenu(this, anchor);
         menu.getMenu().add(0, 1, 0, "Paired computers");
@@ -169,6 +193,8 @@ public final class MainActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         stopped = false;
+        Bridge.upgrade(this);
+        offerNetworkReenable();
         if (NetworkService.shouldRun(this)) startNetwork();
         refresh();
         if (key == null && ready && !busy) loadKey();
@@ -224,7 +250,7 @@ public final class MainActivity extends Activity {
         // Opening the prompt never authorizes a signature: the same CryptoObject still does.
         if (!deskReaderEnabled() || !resumed || stopped || !hasWindowFocus()
                 || !ready || key == null || busy || active != null
-                || pending == null || !pending.kind.equals("authenticate") || pending.expired()
+                || pending == null || !pending.kind.equals(Challenge.AUTHENTICATE) || pending.expired()
                 || getSystemService(KeyguardManager.class).isDeviceLocked()
                 || pending.id.equals(deskSettings.getString("last_request", null))) return;
         // Persist before prompting so recreation cannot repeatedly reopen a canceled request.
@@ -259,7 +285,7 @@ public final class MainActivity extends Activity {
         authenticate.setEnabled(ready && !busy && active == null && (key == null || pending != null
                 || resendable(awaiting) && !awaiting.expired()));
         authenticate.setText(key == null ? "Prepare phone" : resendable(awaiting) ? "Send approval again"
-                : pending != null && pending.kind.equals("enroll") ? "Approve enrollment"
+                : pending != null && pending.kind.equals(Challenge.ENROLL) ? "Approve enrollment"
                 : pending != null && pending.remoteSetup() ? "Allow remote approvals" : "Approve request");
         // Reject is offered whenever a request waits for a decision and no fingerprint prompt is open.
         reject.setVisibility(key != null && pending != null && active == null ? View.VISIBLE : View.GONE);
@@ -305,10 +331,11 @@ public final class MainActivity extends Activity {
 
     private void pollComputer() {
         try {
-            JSONObject envelope = bridge.read("request.json");
-            if (envelope != null && !envelope.toString().equals(seenEnvelope)) {
+            RequestEnvelope envelope = bridge.readRequest();
+            String envelopeText = envelope == null ? null : Bridge.encode(envelope.toByteArray());
+            if (envelope != null && !envelopeText.equals(seenEnvelope)) {
                 cancel("Request replaced", "A new request arrived from the computer.");
-                seenEnvelope = envelope.toString();
+                seenEnvelope = envelopeText;
                 pending = null;
                 awaiting = null;
                 clearProof();
@@ -332,15 +359,14 @@ public final class MainActivity extends Activity {
                 if (icon == null) requester.setImageResource(R.drawable.ic_requester);
                 else requester.setImageBitmap(icon);
                 // Over ntfy only the icon's hash arrives; the computer sends the PNG when Navi asks.
-                iconPending = icon == null && !request.context.optString("icon_sha256").isEmpty()
-                        ? request.context.getString("icon_sha256") : null;
-                requester.setContentDescription(request.context.getString("application") + " icon");
-                showMachine(request.machineName, request.payload.getString("machine_id"),
-                        request.kind.equals("enroll") ? "New pairing" : "Paired computer");
-                ((TextView) findViewById(R.id.application_name)).setText(request.context.getString("application"));
-                ((TextView) findViewById(R.id.account_line)).setText(request.context.getString("requesting_user")
-                        + " → " + request.context.getString("target_user"));
-                String command = request.context.getString("command");
+                iconPending = icon == null && !request.iconSha256().isEmpty() ? request.iconSha256() : null;
+                requester.setContentDescription(request.context.getApplication() + " icon");
+                showMachine(request.machineName, request.machineId,
+                        request.kind.equals(Challenge.ENROLL) ? "New pairing" : "Paired computer");
+                ((TextView) findViewById(R.id.application_name)).setText(request.context.getApplication());
+                ((TextView) findViewById(R.id.account_line)).setText(request.context.getRequestingUser()
+                        + " → " + request.context.getTargetUser());
+                String command = request.context.getCommand();
                 if (!request.id.equals(shownCommandId)) {
                     shownCommandId = request.id;
                     commandExpanded = false;
@@ -353,23 +379,21 @@ public final class MainActivity extends Activity {
                 findViewById(R.id.request_context).setVisibility(View.VISIBLE);
                 findViewById(R.id.preview_notice).setVisibility(request.notificationOnly() ? View.VISIBLE : View.GONE);
                 challenge.setText("REQUEST\n" + request.id + "\nComputer key: "
-                        + request.payload.getString("machine_id") + "\nAction: " + request.context.getString("action_id")
-                        + "\nRequest source: " + request.context.getString("source")
-                        + (request.execution() ? "\nWorking directory: " + request.payload.getJSONObject("execution").getString("cwd") : ""));
-                JSONObject previous = bridge.read("response.json");
-                if (previous != null && request.id.equals(previous.optString("request_id"))) {
-                    if ("signed".equals(previous.optString("status"))) {
-                        if (!Arrays.equals(request.bytes, Bridge.decode(previous.getString("payload_b64")))
-                                || !key.verify(request.bytes, Bridge.decode(previous.getString("signature_b64")))) {
+                        + request.machineId + "\nAction: " + request.context.getActionId()
+                        + "\nRequest source: " + request.context.getSource()
+                        + (request.execution() ? "\nWorking directory: " + request.payload.getExecution().getCwd() : ""));
+                Response previous = bridge.responseFor(request);
+                if (previous != null) {
+                    if (previous.getStatus() == in.akuj.fingerprint.wire.Status.STATUS_SIGNED) {
+                        if (!Bridge.approves(request, previous, key))
                             throw new IllegalArgumentException("Saved response does not verify.");
-                        }
                         awaiting = request;
                         signedResponse = previous;
                         setStatus("Waiting for computer confirmation", "Your signed approval has been sent.");
                     } else setStatus("Approval stopped", "Start a new request on the computer.");
                 } else {
                     pending = request;
-                    setStatus(request.kind.equals("enroll") ? "Pair this computer"
+                    setStatus(request.kind.equals(Challenge.ENROLL) ? "Pair this computer"
                             : request.remoteSetup() ? "Allow remote approvals" : "Authentication requested",
                             request.remoteSetup() ? request.operation + ". When KDE Connect can't reach this phone (for "
                                     + "example on mobile data), " + request.machineName + " sends encrypted requests through "
@@ -389,14 +413,17 @@ public final class MainActivity extends Activity {
             }
             if (awaiting != null) {
                 if (bridge.receipt(awaiting, signedResponse)) {
-                    proofText = new JSONObject().put("phone_response", signedResponse)
-                            .put("computer_receipt", bridge.read("receipt.json")).toString(2);
+                    Signed receipt = bridge.readSigned(Bridge.RECEIPT);
+                    proofText = new JSONObject().put("protocol", "navi.v2 (proto/navi.proto)")
+                            .put("request_id", awaiting.id).put("computer_key", awaiting.machineId)
+                            .put("phone_response_b64", Bridge.encode(signedResponse.toByteArray()))
+                            .put("computer_receipt_b64", receipt == null ? null : Bridge.encode(receipt.toByteArray())).toString(2);
                     proof.setVisibility(View.VISIBLE);
-                    boolean enrolled = awaiting.kind.equals("enroll");
+                    boolean enrolled = awaiting.kind.equals(Challenge.ENROLL);
                     boolean remoteEnabled = awaiting.remoteSetup();
                     dismissNotification(awaiting);
                     showPairedComputers(bridge.pairings());
-                    showMachine(awaiting.machineName, awaiting.payload.getString("machine_id"), "Paired computer");
+                    showMachine(awaiting.machineName, awaiting.machineId, "Paired computer");
                     setStatus(enrolled ? "Phone approved by computer" : remoteEnabled ? "Remote approvals on"
                                     : awaiting.execution() ? "Authorized on " + awaiting.machineName : "Phone approval verified",
                             enrolled ? "The computer signed your public key and verified your biometric approval."
@@ -548,12 +575,12 @@ public final class MainActivity extends Activity {
         setStatus("Waiting for your fingerprint", attempt.request.operation);
         try {
             biometricPrompt()
-                    .setTitle(attempt.request.kind.equals("enroll") ? "Approve computer pairing"
+                    .setTitle(attempt.request.kind.equals(Challenge.ENROLL) ? "Approve computer pairing"
                             : attempt.request.remoteSetup() ? "Allow remote approvals" : "Approve authentication")
-                    .setSubtitle(attempt.request.context.optString("application") + " · " + attempt.request.machineName)
+                    .setSubtitle(attempt.request.context.getApplication() + " · " + attempt.request.machineName)
                     .setDescription((attempt.request.notificationOnly() ? "Verification preview. Desktop authentication is separate.\n" : "")
-                            + attempt.request.operation + "\nAccount: " + attempt.request.context.optString("target_user")
-                            + promptCommand(attempt.request.context.optString("command")))
+                            + attempt.request.operation + "\nAccount: " + attempt.request.context.getTargetUser()
+                            + promptCommand(attempt.request.context.getCommand()))
                     // Leaving the prompt never rejects: it returns to the request, where Reject is explicit.
                     .setNegativeButton("Back to request", getMainExecutor(), (dialog, which) -> returnToReview(attempt,
                             "Review the request", "Approve it with your fingerprint, or reject it."))
@@ -589,26 +616,16 @@ public final class MainActivity extends Activity {
             }
             Signature authorized = result.getCryptoObject() == null ? null : result.getCryptoObject().getSignature();
             if (authorized == null || authorized != attempt.signature) throw new IllegalStateException("Signing operation was not authorized.");
-            byte[] signedBytes = attempt.request.bytes;
-            byte[] ecdhPublic = null;
-            if (attempt.request.remoteSetup()) {
-                // Bind this phone's key-agreement key to the exact setup request with the fingerprint signature.
-                ecdhPublic = attempt.ecdh.getPublic().getEncoded();
-                signedBytes = new byte[attempt.request.bytes.length + 1 + ecdhPublic.length];
-                System.arraycopy(attempt.request.bytes, 0, signedBytes, 0, attempt.request.bytes.length);
-                signedBytes[attempt.request.bytes.length] = '\n';
-                System.arraycopy(ecdhPublic, 0, signedBytes, attempt.request.bytes.length + 1, ecdhPublic.length);
-            }
-            authorized.update(signedBytes);
+            // The fingerprint signs this phone's own Approval: the SHA-256 of the exact request bytes, and for
+            // remote setup also this phone's fresh key-agreement key.
+            byte[] ecdhPublic = attempt.request.remoteSetup() ? attempt.ecdh.getPublic().getEncoded() : null;
+            byte[] approval = Wire.approval(attempt.request.bytes, ecdhPublic);
+            authorized.update(approval);
             byte[] signed = authorized.sign();
             if (attempt.request.expired()) { timeout.run(); return; }
-            if (!key.verify(signedBytes, signed)) throw new IllegalStateException("Phone signature did not verify.");
-            signedResponse = bridge.signed(attempt.request, signed);
-            if (ecdhPublic != null) {
-                signedResponse.put("phone_ecdh_spki_b64", Bridge.encode(ecdhPublic));
-                bridge.write("response.json", signedResponse);
-                enableRemote(attempt);
-            }
+            if (!key.verify(approval, signed)) throw new IllegalStateException("Phone signature did not verify.");
+            signedResponse = bridge.signed(attempt.request, approval, signed);
+            if (ecdhPublic != null) enableRemote(attempt);
             dismissNotification(attempt.request);
             awaiting = attempt.request;
             active = null;
@@ -622,14 +639,14 @@ public final class MainActivity extends Activity {
 
     /** Derives and stores the remote approval key and topics; the computer derives the same ones. */
     private void enableRemote(Attempt attempt) throws Exception {
-        org.json.JSONObject setup = attempt.request.payload.getJSONObject("remote_setup");
+        in.akuj.fingerprint.wire.RemoteSetup setup = attempt.request.payload.getRemoteSetup();
         java.security.PublicKey machine = java.security.KeyFactory.getInstance("EC").generatePublic(
-                new java.security.spec.X509EncodedKeySpec(Bridge.decode(setup.getString("machine_ecdh_spki_b64"))));
+                new java.security.spec.X509EncodedKeySpec(setup.getMachineEcdhSpki().toByteArray()));
         javax.crypto.KeyAgreement agreement = javax.crypto.KeyAgreement.getInstance("ECDH");
         agreement.init(attempt.ecdh.getPrivate());
         agreement.doPhase(machine, true);
-        RemoteChannel.save(this, attempt.request.payload.getString("machine_id"), attempt.request.machineName,
-                setup.getString("server"), setup.has("token") ? setup.getString("token") : null,
+        RemoteChannel.save(this, attempt.request.machineId, attempt.request.machineName,
+                setup.getServer(), setup.getToken().isEmpty() ? null : setup.getToken(),
                 agreement.generateSecret(), attempt.request.id);
         attempt.ecdh = null;
         NetworkService.restart(this);

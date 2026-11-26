@@ -17,7 +17,6 @@ import android.widget.Button;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
-import org.json.JSONObject;
 import java.security.Signature;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,6 +25,8 @@ import java.util.concurrent.Executors;
 public final class SettingsActivity extends Activity {
     /** Returned to MainActivity, which owns the in-memory approval state that a reset must clear. */
     static final int RESULT_RESET = RESULT_FIRST_USER;
+    /** Opened from the "turn direct network approvals on again" notice: start that (one fingerprint). */
+    static final String EXTRA_ENABLE_NETWORK = "in.akuj.fingerprint.ENABLE_NETWORK";
     private static final String TAG = "PhoneAuthenticator";
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -68,7 +69,15 @@ public final class SettingsActivity extends Activity {
         worker.execute(() -> {
             try {
                 SigningKey prepared = SigningKey.prepare();
-                runOnUiThread(() -> { if (!isDestroyed()) { key = prepared; updateStatus(); } });
+                runOnUiThread(() -> {
+                    if (isDestroyed()) return;
+                    key = prepared;
+                    updateStatus();
+                    if (getIntent().getBooleanExtra(EXTRA_ENABLE_NETWORK, false) && !NetworkService.enabled(this)) {
+                        getIntent().removeExtra(EXTRA_ENABLE_NETWORK);
+                        toggleNetwork();
+                    }
+                });
             } catch (Exception error) {
                 Log.w(TAG, "Signing key unavailable in settings", error);
             }
@@ -149,7 +158,7 @@ public final class SettingsActivity extends Activity {
     private void toggleNetwork() {
         if (busy || key == null || stopped) return;
         if (NetworkService.enabled(this)) {
-            getSharedPreferences("network", 0).edit().putBoolean("enabled", false).apply();
+            getSharedPreferences("network", 0).edit().putBoolean("enabled", false).remove(NetworkIdentity.REENABLE).apply();
             NetworkService.restart(this); // Remote approvals, if set up, keep running.
             updateStatus();
             return;
@@ -160,18 +169,18 @@ public final class SettingsActivity extends Activity {
             try {
                 if (bridge.pairings().length() == 0) throw new IllegalStateException("Pair a computer before enabling network authentication.");
                 NetworkIdentity identity = new NetworkIdentity();
-                if (identity.approved(bridge, key)) {
+                if (identity.approved(bridge, key) != null) {
                     runOnUiThread(() -> {
                         busy = false;
                         updateStatus();
                         if (!stopped) {
-                            getSharedPreferences("network", 0).edit().putBoolean("enabled", true).apply();
+                            getSharedPreferences("network", 0).edit().putBoolean("enabled", true).remove(NetworkIdentity.REENABLE).apply();
                             startNetwork();
                         }
                     });
                     return;
                 }
-                byte[] statement = identity.statement(key).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                byte[] statement = identity.statement(key);
                 Signature signature = key.beginSignature();
                 runOnUiThread(() -> {
                     if (stopped) { busy = false; return; }
@@ -192,9 +201,10 @@ public final class SettingsActivity extends Activity {
                                             authorized.update(statement);
                                             byte[] signed = authorized.sign();
                                             if (!key.verify(statement, signed)) throw new IllegalStateException("Network signature did not verify.");
-                                            bridge.write("network-identity.json", new JSONObject()
-                                                    .put("payload_b64", Bridge.encode(statement)).put("signature_b64", Bridge.encode(signed)));
-                                            getSharedPreferences("network", 0).edit().putBoolean("enabled", true).apply();
+                                            bridge.write(NetworkIdentity.FILE, Wire.signed(statement, signed));
+                                            getSharedPreferences("network", 0).edit().putBoolean("enabled", true)
+                                                    .remove(NetworkIdentity.REENABLE).apply();
+                                            NetworkService.cancelReenableNotification(SettingsActivity.this);
                                             finishNetworkSetup(cancellation, null);
                                             startNetwork();
                                         } catch (Exception error) { finishNetworkSetup(cancellation, error); }

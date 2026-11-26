@@ -12,7 +12,6 @@ import pwd
 import re
 import secrets
 import signal
-import socket
 import sqlite3
 import stat
 import struct
@@ -70,7 +69,7 @@ def trusted_file(path, private=False, limit=MAX_MESSAGE):
     return path.read_bytes()
 
 
-IMPLEMENTATION = ("rootauth.py", "host.py", "kdeconnect_transport.py", "ntfy_transport.py")
+IMPLEMENTATION = ("rootauth.py", "host.py", "navi_pb2.py", "kdeconnect_transport.py", "ntfy_transport.py")
 
 
 def check_implementation(directory=None):
@@ -338,7 +337,7 @@ class PhoneAttempt:
             self.remote = crypto.remote_module().validate_config(dict(config["remote"], key=config["remote"].get("key_b64")))
         self.phone = None
         self.request_id = None
-        self.payload = None
+        self.raw = None  # the exact signed request bytes
         self.request = None
         self.delivery_started = False
         self.delivered = False
@@ -387,9 +386,9 @@ class PhoneAttempt:
             raise
         return phone
 
-    async def deliver(self, filename, value, canceled=False):
-        await asyncio.to_thread(self.phone.write, filename, value)
-        if filename != "receipt.json":
+    async def deliver(self, name, value, canceled=False):
+        await asyncio.to_thread(self.phone.write, name, value)
+        if name != "receipt":
             await asyncio.to_thread(self.phone.notify, self.request_id, canceled)
 
     async def run(self, desktop_id, context, execution, environment, deadline):
@@ -399,48 +398,39 @@ class PhoneAttempt:
             self.phone = await asyncio.to_thread(self.connect, environment)
             if self.stopping.is_set() or time.monotonic() >= deadline:
                 return None
-            self.request_id = secrets.token_hex(16)
+            request_bytes = secrets.token_bytes(16)
+            self.request_id = request_bytes.hex()
             now = int(time.time() * 1000)
             leaf_der = self.leaf.public_bytes(crypto.serialization.Encoding.DER)
-            self.payload = dict(domain=crypto.DOMAIN, kind="authenticate", request_id=self.request_id,
-                nonce=crypto.b64(secrets.token_bytes(32)), machine_id=owner.machine_id, phone_key_id=self.phone_key_id,
-                certificate_sha256=crypto.digest(leaf_der), machine_name=socket.gethostname(),
-                operation="Run this command as root", issued_at_ms=now,
-                expires_at_ms=now + int((deadline - time.monotonic()) * 1000),
-                context=context, execution=execution)
-            if hasattr(self.phone, "transport"):  # Only when the request travels through KDE Connect.
-                self.payload["transport"] = self.phone.transport
-            if self.remote is not None:
-                self.payload["remote"] = {"kind": "ntfy"}
-                if self.phone.route == "remote" and context.get("icon_png_base64"):
-                    # Over ntfy only the signed icon hash travels; Navi asks for the PNG if it lacks it.
-                    png = base64.b64decode(context["icon_png_base64"], validate=True)
-                    self.payload["context"] = dict(context, icon_png_base64="", icon_sha256=crypto.digest(png))
-                    self.phone.set_icon(png)
-            self.request = crypto.envelope(owner.key, self.payload)
-            self.request.update(machine_certificate_b64=crypto.b64(owner.root.public_bytes(crypto.serialization.Encoding.DER)),
-                                phone_certificate_b64=crypto.b64(leaf_der))
-            crypto.check_message_size(self.request)
+            if self.remote is not None and self.phone.route == "remote" and context.get("icon_png_base64"):
+                # Over ntfy only the signed icon hash travels; Navi asks for the PNG if it lacks it.
+                png = base64.b64decode(context["icon_png_base64"], validate=True)
+                context = dict(context, icon_png_base64="", icon_sha256=crypto.digest(png))
+                self.phone.set_icon(png)
+            # Paired requests carry no certificates: Navi uses the ones stored at pairing,
+            # named here by machine_id and certificate_sha256.
+            request = crypto.request_message(crypto.pb().KIND_AUTHENTICATE, request_bytes, owner.machine_id, leaf_der,
+                "Run this command as root", now, now + int((deadline - time.monotonic()) * 1000), context,
+                execution=execution,
+                # Only a request that travels through KDE Connect binds Navi's reply to that device.
+                transport=getattr(self.phone, "transport", None), remote=self.remote is not None)
+            self.raw, self.request = crypto.request_envelope(owner.key, request)
             with owner.db:
                 owner.db.execute("INSERT INTO requests VALUES(?,?,?,'pending')",
-                                 (self.request_id, desktop_id, crypto.encode(self.payload)))
+                                 (self.request_id, desktop_id, self.raw))
             self.delivery_started = True
-            await self.deliver("request.json", self.request)
+            await self.deliver("request", self.request)
             self.delivered = True
             route = {"remote": "ntfy", "kde": "kdeconnect", "lan": "network"}.get(
                 getattr(self.phone, "route", None), "kdeconnect" if self.kde_messages else "network")
             audit(f"requested request={self.request_id} desktop={desktop_id} phone={self.phone_key_id} route={route}")
             while not self.stopping.is_set() and time.monotonic() < deadline:
-                value = await asyncio.to_thread(self.phone.read, "response.json")
+                value = await asyncio.to_thread(self.phone.read, "response")
                 if self.stopping.is_set():
                     return None
-                if value and value.get("request_id") == self.request_id:
-                    if value.get("status") != "signed":
-                        raise ValueError("Phone approval was declined")
-                    if crypto.unb64(value["payload_b64"]) != crypto.encode(self.payload) or value["phone_certificate_b64"] != self.request["phone_certificate_b64"]:
-                        raise ValueError("Phone response does not match this exact execution")
-                    signature = crypto.unb64(value["signature_b64"])
-                    self.leaf.public_key().verify(signature, crypto.encode(self.payload), crypto.ec.ECDSA(crypto.hashes.SHA256()))
+                if value is not None and bytes(value.request_id) == request_bytes:
+                    # The biometric Approval must name the SHA-256 of this exact execution request.
+                    signature, _ = crypto.verify_response(value, self.raw, self.leaf)
                     crypto.validate_certificate(self.leaf, owner.root)
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Approval expired")
@@ -472,10 +462,8 @@ class PhoneAttempt:
                 self.authority.db.execute("UPDATE requests SET status='canceled' WHERE id=? AND status IN ('pending','ready')", (self.request_id,))
             if self.delivery_started:
                 try:
-                    cancel = crypto.envelope(self.authority.key, dict(domain=crypto.DOMAIN, kind="cancel", request_id=self.request_id,
-                        machine_id=self.authority.machine_id, phone_key_id=self.phone_key_id,
-                        request_sha256=crypto.digest(crypto.encode(self.payload))))
-                    await self.deliver("cancel.json", cancel, True)
+                    cancel = crypto.cancel_message(self.authority.key, bytes.fromhex(self.request_id), self.raw)
+                    await self.deliver("cancel", cancel, True)
                 except Exception as error:
                     audit(f"phone-cancel-delivery-failed request={self.request_id}: {type(error).__name__}")
         if self.phone is not None and hasattr(self.phone, "close"):
@@ -556,7 +544,7 @@ class Authority:
                         break
             if winner is None:
                 raise ConnectionError("No enrolled phone approved; devices may be offline or have declined")
-            request_id, request, payload = winner.request_id, winner.request, winner.payload
+            request_id, request = winner.request_id, winner.request
             # Only this winner can become ready. Other phone proofs are withdrawn
             # concurrently; a slow/offline device cannot delay the command.
             for attempt in self.attempts:
@@ -597,15 +585,14 @@ class Authority:
                 finally:
                     os.close(log_fd)
             audit(f"executed request={request_id} desktop={desktop_id} phone={winner.phone_key_id} uid=0 pid={child.pid}")
-            receipt = crypto.envelope(self.key, dict(domain=crypto.DOMAIN, kind="receipt", request_id=request_id,
-                machine_id=self.machine_id, phone_key_id=winner.phone_key_id, response_sha256=crypto.digest(signature),
-                status="approved", verified_at_ms=int(time.time() * 1000), execution_pid=child.pid))
-            crypto.atomic_write(STATE / "last-execution.json", crypto.encode(dict(request=request,
-                signature_b64=crypto.b64(signature), receipt=receipt, pid=child.pid,
+            receipt = crypto.receipt_message(self.key, bytes.fromhex(request_id), signature, child.pid)
+            crypto.atomic_write(STATE / "last-execution.json", crypto.encode(dict(request=crypto.b64(crypto.wire(request)),
+                signature_b64=crypto.b64(signature), receipt=crypto.b64(crypto.wire(receipt)), pid=child.pid,
+                verified_at_ms=int(time.time() * 1000),
                 phone_attempts=[dict(phone_key_id=a.phone_key_id, request_id=a.request_id,
                                      delivered=a.delivered, error=a.error) for a in self.attempts])))
             try:
-                await winner.deliver("receipt.json", receipt)
+                await winner.deliver("receipt", receipt)
             finally:
                 await send(writer, "executed", desktop_id, pid=child.pid)
                 terminal_sent = True

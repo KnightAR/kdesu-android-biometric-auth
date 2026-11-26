@@ -13,43 +13,47 @@ import android.os.Build;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.util.Log;
+import in.akuj.fingerprint.wire.EnrollOffer;
+import in.akuj.fingerprint.wire.Mail;
+import in.akuj.fingerprint.wire.OfferEnvelope;
+import in.akuj.fingerprint.wire.RequestEnvelope;
+import in.akuj.fingerprint.wire.Response;
+import in.akuj.fingerprint.wire.Signed;
+import in.akuj.fingerprint.wire.Status;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.regex.Pattern;
 import org.json.JSONObject;
 
-/** Signed mailbox carried by stock KDE Connect file sharing. */
+/** Signed mailbox carried by stock KDE Connect file sharing: each file is one protobuf Mail. */
 final class KdeConnectInbox {
     static final String AUTHORITY = "in.akuj.fingerprint.documents";
     static final String PACKAGE = "org.kde.kdeconnect_tp";
     static final int MAX_FILE = 65536;
-    /** KDE Connect may append " (1)" when a name already exists in Downloads. */
-    private static final Pattern DOWNLOAD_FILE =
-            Pattern.compile("navi-auth-(request|receipt|cancel|enroll-offer)-[a-f0-9]{32}( \\(\\d{1,3}\\))?\\.json");
+    static final String MIME = "application/octet-stream";
+    /** Names of computer messages; KDE Connect may append " (1)" when a name already exists in Downloads. */
+    static final String MESSAGE_NAME = "navi-auth-(request|receipt|cancel|enroll-offer)-[a-f0-9]{32}";
+    private static final Pattern DOWNLOAD_FILE = Pattern.compile(MESSAGE_NAME + "( \\(\\d{1,3}\\))?\\.pb");
 
     static String desktop(Challenge request) throws Exception {
-        JSONObject transport = request.payload.optJSONObject("transport");
-        if (transport == null || !"kdeconnect-share".equals(transport.optString("kind"))) return null;
-        String id = transport.getString("desktop_device_id");
+        if (!request.payload.hasTransport()) return null;
+        String id = request.payload.getTransport().getDesktopDeviceId();
         if (!id.matches("[A-Za-z0-9_-]{1,128}")) throw new IllegalArgumentException("Invalid paired computer route.");
         return id;
     }
 
     static boolean uses(Challenge request) {
-        return request != null && request.payload.optJSONObject("transport") != null
-                && "kdeconnect-share".equals(request.payload.optJSONObject("transport").optString("kind"));
+        return request != null && request.payload.hasTransport();
     }
 
     static void sendResponse(Activity activity, Challenge request) throws Exception {
         String device = desktop(request);
         if (device == null) return;
-        JSONObject response = new Bridge(activity).read("response.json");
-        if (response == null || !request.id.equals(response.optString("request_id")))
+        if (new Bridge(activity).responseFor(request) == null)
             throw new IllegalStateException("This approval is no longer available.");
         if (request.expired()) throw new IllegalStateException("The request expired before delivery.");
         // Reuse KDE Connect's persisted read/write inbox tree grant. Its upload
@@ -58,7 +62,7 @@ final class KdeConnectInbox {
                 DocumentsContract.buildTreeDocumentUri(AUTHORITY, "navi"), "response:" + request.id);
         Intent share = new Intent(Intent.ACTION_SEND)
                 .setComponent(new ComponentName(PACKAGE, "org.kde.kdeconnect.plugins.share.ShareActivity"))
-                .setType("application/json").putExtra("deviceId", device)
+                .setType(MIME).putExtra("deviceId", device)
                 .putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         share.setClipData(ClipData.newRawUri("Signed authentication response", uri));
         activity.startActivity(share);
@@ -72,7 +76,7 @@ final class KdeConnectInbox {
                 DocumentsContract.buildTreeDocumentUri(AUTHORITY, "navi"), "hello:" + verified.getString("session_id"));
         Intent share = new Intent(Intent.ACTION_SEND)
                 .setComponent(new ComponentName(PACKAGE, "org.kde.kdeconnect.plugins.share.ShareActivity"))
-                .setType("application/json").putExtra("deviceId", device)
+                .setType(MIME).putExtra("deviceId", device)
                 .putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         share.setClipData(ClipData.newRawUri("Pairing confirmation", uri));
         activity.startActivity(share);
@@ -102,7 +106,7 @@ final class KdeConnectInbox {
     /** System file picker for a navi-auth-enroll-offer file, opening in Downloads. */
     static Intent offerPicker() {
         return new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
-                .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/json", "text/plain", "application/octet-stream"})
+                .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{MIME, "application/x-protobuf", "application/vnd.google.protobuf"})
                 .putExtra(DocumentsContract.EXTRA_INITIAL_URI,
                         Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADownload"));
     }
@@ -116,20 +120,17 @@ final class KdeConnectInbox {
     static ImportResult importOffer(Context context, Uri uri) {
         try {
             byte[] bytes = readDocument(context, uri);
-            JSONObject mail;
+            Mail mail;
             try {
-                mail = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            } catch (Exception error) {
-                throw new IllegalArgumentException("This is not a Navi pairing offer.");
-            }
-            String id = mail.optString("request_id");
-            if (!Challenge.DOMAIN.equals(mail.optString("domain")) || !"kdeconnect-mail".equals(mail.optString("kind"))
-                    || !id.matches("[a-f0-9]{32}") || !"enroll-offer.json".equals(mail.optString("name")))
+                mail = Wire.parse(Mail::parseFrom, bytes, MAX_FILE);
+            } catch (IllegalArgumentException error) {
                 throw new IllegalArgumentException("This is not a Navi pairing offer. Choose the navi-auth-enroll-offer file.");
-            JSONObject offer = mail.getJSONObject("value");
-            JSONObject payload = PairingCode.validateOffer(offer);
-            if (!id.equals(payload.getString("session_id"))) throw new IllegalArgumentException("Offer does not match its delivery name.");
-            String name = payload.getString("machine_name");
+            }
+            if (mail.getValueCase() != Mail.ValueCase.OFFER)
+                throw new IllegalArgumentException("This is not a Navi pairing offer. Choose the navi-auth-enroll-offer file.");
+            OfferEnvelope offer = mail.getOffer();
+            EnrollOffer payload = PairingCode.validateOffer(offer);
+            String name = payload.getMachineName();
             if (!canFollowFromDownloads(context)) return new ImportResult(ImportResult.Kind.NEEDS_SETUP, name, null);
             PairingCode.receiveOffer(context, offer);
             return new ImportResult(ImportResult.Kind.ACCEPTED, name, null);
@@ -140,13 +141,6 @@ final class KdeConnectInbox {
             return new ImportResult(ImportResult.Kind.ERROR, null,
                     "This pairing offer could not be used. Start pairing again on the computer.");
         }
-    }
-
-    private static void storeOffer(Context context, JSONObject mail, String id) throws Exception {
-        JSONObject offer = mail.getJSONObject("value");
-        JSONObject payload = new JSONObject(new String(Bridge.decode(offer.getString("payload_b64")), StandardCharsets.UTF_8));
-        if (!id.equals(payload.getString("session_id"))) throw new IllegalArgumentException("Offer does not match its delivery name.");
-        PairingCode.receiveOffer(context, offer);
     }
 
     /** Reads at most MAX_FILE bytes from a picked or shared document. */
@@ -209,20 +203,26 @@ final class KdeConnectInbox {
     }
 
     static void receive(Context context, byte[] bytes) throws Exception {
-        if (bytes.length > MAX_FILE) throw new IllegalArgumentException("Authentication file is too large.");
-        JSONObject mail = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-        String name = mail.getString("name");
-        String id = mail.getString("request_id");
-        if (!Challenge.DOMAIN.equals(mail.getString("domain")) || !"kdeconnect-mail".equals(mail.getString("kind"))
-                || !id.matches("[a-f0-9]{32}")
-                || !Arrays.asList("request.json", "receipt.json", "cancel.json", "enroll-offer.json").contains(name))
-            throw new IllegalArgumentException("Invalid authentication file.");
-        if ("enroll-offer.json".equals(name)) {
-            storeOffer(context, mail, id);
-            context.getSharedPreferences("kdeconnect", 0).edit().putBoolean("received", true).apply();
-            return;
+        Mail mail = Wire.parse(Mail::parseFrom, bytes, MAX_FILE);
+        switch (mail.getValueCase()) {
+            case OFFER:
+                PairingCode.receiveOffer(context, mail.getOffer());
+                context.getSharedPreferences("kdeconnect", 0).edit().putBoolean("received", true).apply();
+                return;
+            case REQUEST:
+                deliver(context, mail.getRequest(), null, false, ROUTE_KDECONNECT, null);
+                return;
+            case RECEIPT:
+            case CANCEL:
+                // Terminal messages carry the request they end: a cancel may overtake that request.
+                if (!mail.hasOriginalRequest()) throw new IllegalArgumentException("Invalid authentication file.");
+                boolean cancel = mail.getValueCase() == Mail.ValueCase.CANCEL;
+                deliver(context, mail.getOriginalRequest(), cancel ? mail.getCancel() : mail.getReceipt(), cancel,
+                        ROUTE_KDECONNECT, null);
+                return;
+            default:
+                throw new IllegalArgumentException("Invalid authentication file.");
         }
-        deliver(context, mail, ROUTE_KDECONNECT, null);
     }
 
     static final String ROUTE_KDECONNECT = "kdeconnect", ROUTE_REMOTE = "remote", ROUTE_LAN = "lan";
@@ -241,25 +241,23 @@ final class KdeConnectInbox {
     }
 
     /**
-     * A verified-format mailbox message from KDE Connect, or one decrypted from ntfy ({@code route} remote,
-     * from the configured computer {@code remoteMachine}). The same validation applies to both.
+     * A request ({@code terminal} null), or a receipt or cancel ({@code terminal}) together with the request
+     * it ends, from KDE Connect or decrypted from ntfy ({@code route} remote, from the configured computer
+     * {@code remoteMachine}). The same validation applies to both.
      */
-    static void deliver(Context context, JSONObject mail, String route, String remoteMachine) throws Exception {
-        String name = mail.getString("name");
-        String id = mail.getString("request_id");
-        if (!id.matches("[a-f0-9]{32}") || !Arrays.asList("request.json", "receipt.json", "cancel.json").contains(name))
-            throw new IllegalArgumentException("Invalid authentication message.");
+    static void deliver(Context context, RequestEnvelope envelope, Signed terminal, boolean cancel, String route,
+                        String remoteMachine) throws Exception {
         boolean remote = ROUTE_REMOTE.equals(route);
+        boolean requestMessage = terminal == null;
         Challenge accepted = null;
         synchronized (Bridge.MAILBOX) {
             Bridge bridge = new Bridge(context);
             SigningKey key = SigningKey.prepare();
-            JSONObject value = mail.getJSONObject("value");
-            boolean requestMessage = "request.json".equals(name);
-            Challenge request = bridge.validate(requestMessage ? value : mail.getJSONObject("request"), key, !requestMessage);
+            Challenge request = bridge.validate(envelope, key, !requestMessage);
+            String id = request.id;
             // Enrollment is only reachable here after Bridge.validate accepted a code-pinned computer.
-            if (!id.equals(request.id) || (remote ? !RemoteChannel.bound(request) || !"authenticate".equals(request.kind)
-                    || !request.payload.getString("machine_id").equals(remoteMachine) : desktop(request) == null))
+            if (remote ? !RemoteChannel.bound(request) || !Challenge.AUTHENTICATE.equals(request.kind)
+                    || !request.machineId.equals(remoteMachine) : desktop(request) == null)
                 throw new IllegalArgumentException("Authentication does not match its delivery route.");
             JSONObject tombstones = bridge.read("kde-cancellations.json");
             if (tombstones == null) tombstones = new JSONObject();
@@ -271,21 +269,22 @@ final class KdeConnectInbox {
                 if (tombstones.getJSONObject(previous).getLong("until") < now) expired.add(previous);
             }
             for (String previous : expired) tombstones.remove(previous);
-            String tombstoneId = request.payload.getString("machine_id") + ":" + id;
+            String tombstoneId = request.machineId + ":" + id;
             String requestHash = Bridge.hash(request.bytes);
-            if ("cancel.json".equals(name)) {
-                if (!bridge.canceled(request, value)) throw new IllegalArgumentException("Invalid signed withdrawal.");
+            RequestEnvelope current = bridge.readRequest();
+            boolean isCurrent = current != null && Arrays.equals(current.getSigned().getPayload().toByteArray(), request.bytes);
+            if (cancel) {
+                if (!bridge.canceled(request, terminal)) throw new IllegalArgumentException("Invalid signed withdrawal.");
                 // The transfer may overtake its request. Remember only verified, recent cancellation.
-                long until = request.payload.getLong("expires_at_ms") + 30000;
+                long until = request.expiresAt + 30000;
                 if (until > now) {
                     if (tombstones.length() >= 64 && !tombstones.has(tombstoneId))
                         throw new IllegalStateException("Too many pending computer withdrawals.");
                     tombstones.put(tombstoneId, new JSONObject().put("until", until).put("hash", requestHash));
                 }
                 bridge.write("kde-cancellations.json", tombstones);
-                JSONObject current = bridge.read("request.json");
-                if (current != null && Arrays.equals(Bridge.decode(current.getString("payload_b64")), request.bytes)) {
-                    bridge.write(name, value);
+                if (isCurrent) {
+                    bridge.write(Bridge.CANCEL, terminal);
                     RequestReceiver.refreshNotification(context, id, true);
                 }
                 return;
@@ -293,21 +292,20 @@ final class KdeConnectInbox {
             if (requestMessage) {
                 JSONObject withdrawn = tombstones.optJSONObject(tombstoneId);
                 if (withdrawn != null && requestHash.equals(withdrawn.getString("hash"))) return;
-                JSONObject old = bridge.read("request.json");
-                if (old != null) {
+                if (current != null) {
                     try {
-                        Challenge previous = bridge.validate(old, key);
+                        Challenge previous = bridge.validate(current, key);
                         if (previous.id.equals(id)) {
                             if (!Arrays.equals(previous.bytes, request.bytes)) throw new IllegalArgumentException("Changed request.");
                             return;
                         }
-                        JSONObject response = bridge.read("response.json");
-                        boolean finished = bridge.canceled(previous) || response != null && previous.id.equals(response.optString("request_id"))
-                                && ("declined".equals(response.optString("status")) || bridge.receipt(previous, response));
+                        Response response = bridge.responseFor(previous);
+                        boolean finished = bridge.canceled(previous) || response != null
+                                && (response.getStatus() == Status.STATUS_DECLINED || bridge.receipt(previous, response));
                         if (!finished) throw new IllegalStateException("Another computer request is active.");
                     } catch (Challenge.Expired ignored) { }
                 }
-                bridge.write(name, value);
+                bridge.write(Bridge.REQUEST, envelope);
                 recordRoute(bridge, id, route);
                 bridge.write("kde-cancellations.json", tombstones);
                 if (!remote) context.getSharedPreferences("kdeconnect", 0).edit().putBoolean("received", true).apply();
@@ -315,12 +313,10 @@ final class KdeConnectInbox {
                 RequestReceiver.refreshNotification(context, id, false);
                 accepted = request;
             } else {
-                JSONObject current = bridge.read("request.json");
-                JSONObject response = bridge.read("response.json");
-                if (current == null || !Arrays.equals(Bridge.decode(current.getString("payload_b64")), request.bytes)
-                        || response == null || !id.equals(response.optString("request_id")) || !bridge.receipt(request, response, value))
+                Response response = bridge.responseFor(request);
+                if (!isCurrent || response == null || !bridge.receipt(request, response, terminal))
                     throw new IllegalArgumentException("Confirmation does not match the current approval.");
-                bridge.write(name, value);
+                bridge.write(Bridge.RECEIPT, terminal);
             }
         }
         // Over ntfy the request carries only its icon's hash; fetch the PNG if Navi doesn't have it.

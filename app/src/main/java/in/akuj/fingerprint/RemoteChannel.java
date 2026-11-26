@@ -6,6 +6,13 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.Base64;
 import android.util.Log;
+import com.google.protobuf.ByteString;
+import in.akuj.fingerprint.wire.Icon;
+import in.akuj.fingerprint.wire.IconRequest;
+import in.akuj.fingerprint.wire.Payload;
+import in.akuj.fingerprint.wire.RemoteMessage;
+import in.akuj.fingerprint.wire.RequestEnvelope;
+import in.akuj.fingerprint.wire.Response;
 import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -25,8 +32,6 @@ import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
-import java.util.zip.Deflater;
-import java.util.zip.Inflater;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
@@ -36,15 +41,16 @@ import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.HttpsURLConnection;
 
 /**
- * Remote approvals over an ntfy server (navi-remote/v1), used by the computer only when KDE Connect
+ * Remote approvals over an ntfy server (navi-remote/v2), used by the computer only when KDE Connect
  * cannot see this phone. Navi subscribes to its inbox topic(s) itself and publishes replies to the
  * computer's inbox. Topics and the message key come from the fingerprint-approved ECDH setup and are
- * never transmitted. Every message is DEFLATE-compressed, then AES-256-GCM encrypted and bound to its
+ * never transmitted. Every message is a protobuf RemoteMessage, AES-256-GCM encrypted and bound to its
  * direction and topic. Nothing received here is trusted beyond that: requests still go through
  * Bridge.validate (machine signature, pairing, expiry) exactly like the other routes.
  */
 final class RemoteChannel {
-    static final String PROTOCOL = "navi-remote/v1";
+    /** Message AAD. The key and topic derivation keep their "navi-remote/v1" labels (no new setup needed). */
+    static final String PROTOCOL = "navi-remote/v2";
     static final String TO_PHONE = "to-phone", TO_COMPUTER = "to-computer";
     static final int INLINE_LIMIT = 3800, MAX_PLAIN = 65536, MAX_BLOB = 98304, MAX_LINE = 262144;
     static final Pattern TOPIC = Pattern.compile("navi-[a-z2-7]{26}");
@@ -199,48 +205,27 @@ final class RemoteChannel {
         return (PROTOCOL + "\n" + direction + "\n" + topic).getBytes(StandardCharsets.US_ASCII);
     }
 
-    static byte[] seal(byte[] key, String direction, String topic, JSONObject value) throws Exception {
-        byte[] plain = value.toString().getBytes(StandardCharsets.UTF_8);
+    static byte[] seal(byte[] key, String direction, String topic, RemoteMessage value) throws Exception {
+        byte[] plain = value.toByteArray();
         if (plain.length > MAX_PLAIN) throw new IllegalArgumentException("Remote message is too large.");
-        Deflater deflater = new Deflater(9);
-        deflater.setInput(plain);
-        deflater.finish();
-        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        while (!deflater.finished()) compressed.write(buffer, 0, deflater.deflate(buffer));
-        deflater.end();
         byte[] nonce = new byte[12];
         RANDOM.nextBytes(nonce);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
         cipher.updateAAD(aad(direction, topic));
-        byte[] sealed = cipher.doFinal(compressed.toByteArray());
+        byte[] sealed = cipher.doFinal(plain);
         byte[] out = new byte[12 + sealed.length];
         System.arraycopy(nonce, 0, out, 0, 12);
         System.arraycopy(sealed, 0, out, 12, sealed.length);
         return out;
     }
 
-    static JSONObject open(byte[] key, String direction, String topic, byte[] blob) throws Exception {
-        if (blob.length < 28 || blob.length > MAX_BLOB) throw new IllegalArgumentException("Invalid remote message size.");
+    static RemoteMessage open(byte[] key, String direction, String topic, byte[] blob) throws Exception {
+        if (blob.length < 28 || blob.length > Math.min(MAX_BLOB, MAX_PLAIN + 28)) throw new IllegalArgumentException("Invalid remote message size.");
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, blob, 0, 12));
         cipher.updateAAD(aad(direction, topic));
-        byte[] compressed = cipher.doFinal(blob, 12, blob.length - 12);
-        Inflater inflater = new Inflater();
-        inflater.setInput(compressed);
-        ByteArrayOutputStream plain = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        try {
-            while (!inflater.finished()) {
-                int count = inflater.inflate(buffer);
-                if (count == 0 && (inflater.needsInput() || inflater.needsDictionary()))
-                    throw new IllegalArgumentException("Truncated remote message.");
-                plain.write(buffer, 0, count);
-                if (plain.size() > MAX_PLAIN) throw new IllegalArgumentException("Remote message inflates beyond its limit.");
-            }
-        } finally { inflater.end(); }
-        return new JSONObject(new String(plain.toByteArray(), StandardCharsets.UTF_8));
+        return Wire.parse(RemoteMessage::parseFrom, cipher.doFinal(blob, 12, blob.length - 12), MAX_PLAIN);
     }
 
     static String b64url(byte[] data) {
@@ -271,7 +256,7 @@ final class RemoteChannel {
     }
 
     /** Publishes to the computer's inbox. Network I/O: call off the main thread. */
-    static void publish(Config config, JSONObject value) throws Exception {
+    static void publish(Config config, RemoteMessage value) throws Exception {
         byte[] blob = seal(config.key, TO_COMPUTER, config.computerTopic, value);
         String text = b64url(blob);
         boolean inline = text.length() <= INLINE_LIMIT;
@@ -387,81 +372,73 @@ final class RemoteChannel {
     }
 
     // --- Phone-side message handling -------------------------------------------------------
-    private static void handle(Context context, Config config, JSONObject message) throws Exception {
-        String name = message.getString("name");
-        String id = message.getString("request_id");
-        if (!id.matches("[a-f0-9]{32}")) throw new IllegalArgumentException("Invalid remote request id.");
-        if ("icon".equals(name)) {
-            acceptIcon(context, id, message.getString("icon_png_base64"));
-            return;
+    private static void handle(Context context, Config config, RemoteMessage message) throws Exception {
+        switch (message.getBodyCase()) {
+            case ICON:
+                acceptIcon(context, message.getIcon());
+                return;
+            case REQUEST:
+                // The same RequestEnvelope as on the other routes.
+                KdeConnectInbox.deliver(context, message.getRequest(), null, false, KdeConnectInbox.ROUTE_REMOTE, config.machineId);
+                return;
+            case RECEIPT:
+            case CANCEL: {
+                // Navi holds the request these end: match it by request ID, then verify as usual.
+                boolean cancel = message.getBodyCase() == RemoteMessage.BodyCase.CANCEL;
+                in.akuj.fingerprint.wire.Signed terminal = cancel ? message.getCancel() : message.getReceipt();
+                byte[] raw = terminal.getPayload().toByteArray();
+                ByteString id = cancel ? Wire.peek(raw, Payload.BodyCase.CANCEL).getCancel().getRequestId()
+                        : Wire.peek(raw, Payload.BodyCase.RECEIPT).getReceipt().getRequestId();
+                RequestEnvelope current = new Bridge(context).readRequest();
+                if (current == null || !id.equals(Wire.peek(current.getSigned().getPayload().toByteArray(),
+                        Payload.BodyCase.REQUEST).getRequest().getRequestId()))
+                    throw new IllegalArgumentException("Remote confirmation does not match the current request.");
+                KdeConnectInbox.deliver(context, current, terminal, cancel, KdeConnectInbox.ROUTE_REMOTE, config.machineId);
+                return;
+            }
+            default:
+                throw new IllegalArgumentException("Unknown remote message.");
         }
-        JSONObject mail = new JSONObject().put("domain", Challenge.DOMAIN).put("kind", "kdeconnect-mail")
-                .put("name", name).put("request_id", id);
-        if ("request.json".equals(name)) {
-            JSONObject compact = message.getJSONObject("value");
-            mail.put("value", new JSONObject()
-                    .put("payload_b64", Bridge.encode(compact.getString("payload_json").getBytes(StandardCharsets.UTF_8)))
-                    .put("signature_b64", compact.getString("signature_b64"))
-                    .put("machine_certificate_b64", compact.getString("machine_certificate_b64"))
-                    .put("phone_certificate_b64", compact.getString("phone_certificate_b64")));
-        } else if ("receipt.json".equals(name) || "cancel.json".equals(name)) {
-            // Sent by reference: attach the request Navi already holds, if it is the one meant.
-            JSONObject current = new Bridge(context).read("request.json");
-            if (current == null || !Bridge.hash(Bridge.decode(current.getString("payload_b64"))).equals(message.getString("request_sha256")))
-                throw new IllegalArgumentException("Remote confirmation does not match the current request.");
-            mail.put("value", message.getJSONObject("value")).put("request", current);
-        } else throw new IllegalArgumentException("Unknown remote message.");
-        KdeConnectInbox.deliver(context, mail, KdeConnectInbox.ROUTE_REMOTE, config.machineId);
     }
 
     /** Called after a request arrived over ntfy without its icon: ask the computer for that one icon. */
     static void requestIconIfMissing(Context context, Challenge request) {
-        String hash = request.context.optString("icon_sha256");
+        String hash = request.iconSha256();
         if (hash.isEmpty() || IconCache.get(context, hash) != null) return;
         try {
-            Config config = forMachine(context, request.payload.getString("machine_id"));
-            if (config != null) publish(config, new JSONObject().put("name", "icon-request")
-                    .put("request_id", request.id).put("icon_sha256", hash));
+            Config config = forMachine(context, request.machineId);
+            if (config != null) publish(config, RemoteMessage.newBuilder().setIconRequest(IconRequest.newBuilder()
+                    .setRequestId(request.payload.getRequestId()).setIconSha256(request.context.getIconSha256())).build());
         } catch (Exception error) {
             Log.w(TAG, "Icon request not sent; the default icon stays", error);
         }
     }
 
-    private static void acceptIcon(Context context, String id, String encoded) throws Exception {
+    private static void acceptIcon(Context context, Icon icon) throws Exception {
         Bridge bridge = new Bridge(context);
-        JSONObject current = bridge.read("request.json");
+        RequestEnvelope current = bridge.readRequest();
         if (current == null) return;
         Challenge request = bridge.validate(current, SigningKey.prepare(), true);
-        String expected = request.context.optString("icon_sha256");
-        byte[] png = Bridge.decode(encoded);
-        if (!request.id.equals(id) || expected.isEmpty() || !Bridge.hash(png).equals(expected))
+        String expected = request.iconSha256();
+        byte[] png = icon.getPng().toByteArray();
+        if (!request.id.equals(Wire.hex(icon.getRequestId())) || expected.isEmpty() || !Bridge.hash(png).equals(expected))
             throw new IllegalArgumentException("Icon does not match the signed request.");
         RequesterIcon.check(png);
         IconCache.put(context, expected, png);
-        RequestReceiver.refreshNotification(context, id, false);
+        RequestReceiver.refreshNotification(context, request.id, false);
     }
 
     /** Sends this phone's signed reply (or decline) for a request that arrived over ntfy. Off the main thread. */
     static void sendResponse(Context context, Challenge request) throws Exception {
-        Config config = forMachine(context, request.payload.getString("machine_id"));
+        Config config = forMachine(context, request.machineId);
         if (config == null) throw new IllegalStateException("Remote approvals are off for this computer.");
-        JSONObject response = new Bridge(context).read("response.json");
-        if (response == null || !request.id.equals(response.optString("request_id")))
-            throw new IllegalStateException("This approval is no longer available.");
-        JSONObject message = new JSONObject().put("name", "response.json").put("request_id", request.id)
-                .put("status", response.getString("status"));
-        if ("signed".equals(response.getString("status"))) {
-            message.put("signature_b64", response.getString("signature_b64"));
-            if (response.has("phone_ecdh_spki_b64")) message.put("phone_ecdh_spki_b64", response.getString("phone_ecdh_spki_b64"));
-        } else {
-            message.put("message", response.optString("message"));
-        }
-        publish(config, message);
+        Response response = new Bridge(context).responseFor(request);
+        if (response == null) throw new IllegalStateException("This approval is no longer available.");
+        publish(config, RemoteMessage.newBuilder().setResponse(response).build());
     }
 
     static boolean bound(Challenge request) {
-        return request != null && request.payload.optJSONObject("remote") != null
-                && "ntfy".equals(request.payload.optJSONObject("remote").optString("kind"));
+        return request != null && request.payload.hasRemote();
     }
 
     static String hash(byte[] data) throws Exception {

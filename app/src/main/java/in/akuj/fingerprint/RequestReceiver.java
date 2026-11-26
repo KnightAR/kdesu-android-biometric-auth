@@ -10,7 +10,6 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.SystemClock;
 import android.util.Log;
-import org.json.JSONObject;
 
 /** An explicit, shell-permission-protected delivery signal for the ADB MVP. */
 public final class RequestReceiver extends BroadcastReceiver {
@@ -39,7 +38,7 @@ public final class RequestReceiver extends BroadcastReceiver {
     static void refreshNotification(Context context, String expectedId, boolean cancellation) {
             try {
                 Bridge bridge = new Bridge(context);
-                JSONObject envelope = bridge.read("request.json");
+                in.akuj.fingerprint.wire.RequestEnvelope envelope = bridge.readRequest();
                 if (envelope == null) return;
                 Challenge request = bridge.validate(envelope, SigningKey.prepare());
                 if (!expectedId.equals(request.id) || request.expired()) return;
@@ -49,8 +48,7 @@ public final class RequestReceiver extends BroadcastReceiver {
                     return;
                 }
                 if (cancellation) return;
-                JSONObject response = bridge.read("response.json");
-                if (response != null && request.id.equals(response.optString("request_id"))) return;
+                if (bridge.responseFor(request) != null) return;
                 Bitmap requester = RequesterIcon.decode(context, request.context);
                 createChannel(context);
                 Intent open = new Intent(context, MainActivity.class)
@@ -61,12 +59,12 @@ public final class RequestReceiver extends BroadcastReceiver {
                         PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                 Notification.Builder notification = new Notification.Builder(context, CHANNEL)
                         .setSmallIcon(R.drawable.ic_notification)
-                        .setContentTitle(request.machineName + " · " + request.context.getString("application"))
+                        .setContentTitle(request.machineName + " · " + request.context.getApplication())
                         .setContentText(request.operation)
-                        .setSubText((request.kind.equals("enroll") ? "New computer · " : "Paired computer · ")
-                                + request.payload.getString("machine_id").substring(0, 12))
+                        .setSubText((request.kind.equals(Challenge.ENROLL) ? "New computer · " : "Paired computer · ")
+                                + request.machineId.substring(0, 12))
                         .setStyle(new Notification.BigTextStyle().bigText(request.operation + "\nAccount: "
-                                + request.context.getString("target_user")))
+                                + request.context.getTargetUser()))
                         .setContentIntent(action)
                         .addAction(new Notification.Action.Builder(null, "Review and authenticate", action).build())
                         .setCategory(Notification.CATEGORY_EVENT)

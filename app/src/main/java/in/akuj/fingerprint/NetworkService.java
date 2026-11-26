@@ -11,11 +11,23 @@ import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
-import java.io.ByteArrayOutputStream;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.MessageLite;
+import in.akuj.fingerprint.wire.Mail;
+import in.akuj.fingerprint.wire.MailName;
+import in.akuj.fingerprint.wire.NetworkHello;
+import in.akuj.fingerprint.wire.NetworkReply;
+import in.akuj.fingerprint.wire.NetworkRpc;
+import in.akuj.fingerprint.wire.Op;
+import in.akuj.fingerprint.wire.Payload;
+import in.akuj.fingerprint.wire.RequestEnvelope;
+import in.akuj.fingerprint.wire.Response;
+import in.akuj.fingerprint.wire.Signed;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -35,7 +47,7 @@ public final class NetworkService extends Service {
     private static final int LIMIT = 131072;
     private static final int NOTIFICATION_ID = 2;
     static final String CHANNEL = "computer_connection";
-    private static final int RECOVERY_NOTIFICATION_ID = 3;
+    private static final int RECOVERY_NOTIFICATION_ID = 3, REENABLE_NOTIFICATION_ID = 4;
     static volatile String status = "Network connection is off";
     static volatile String remoteStatus = "";
     static volatile boolean running;
@@ -48,6 +60,7 @@ public final class NetworkService extends Service {
     private final ThreadPoolExecutor clients = new ThreadPoolExecutor(2, 2, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(4));
     private Bridge bridge;
     private SigningKey key;
+    private Signed identityStatement;
     private final Object mailbox = Bridge.MAILBOX;
     private final java.util.Timer deadlines = new java.util.Timer("navi-lan-deadlines", true);
     private final java.util.Set<SSLSocket> sockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -92,6 +105,23 @@ public final class NetworkService extends Service {
                         .setContentIntent(open).setAutoCancel(true).build());
     }
 
+    /** An update turned direct network approvals off; tapping starts turning them on again. */
+    static void showReenableNotification(Context context) {
+        createChannel(context);
+        PendingIntent open = PendingIntent.getActivity(context, 4, new Intent(context, SettingsActivity.class)
+                        .putExtra(SettingsActivity.EXTRA_ENABLE_NETWORK, true),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        context.getSystemService(NotificationManager.class).notify(REENABLE_NOTIFICATION_ID,
+                new Notification.Builder(context, CHANNEL).setSmallIcon(R.drawable.ic_notification)
+                        .setContentTitle("Direct network approvals are off")
+                        .setContentText("Navi was updated. Tap to turn them on again with your fingerprint.")
+                        .setContentIntent(open).setAutoCancel(true).build());
+    }
+
+    static void cancelReenableNotification(Context context) {
+        context.getSystemService(NotificationManager.class).cancel(REENABLE_NOTIFICATION_ID);
+    }
+
     private Notification notification() {
         PendingIntent open = PendingIntent.getActivity(this, 1, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         PendingIntent setup = PendingIntent.getActivity(this, 2, new Intent(this, BackgroundSetupActivity.class), PendingIntent.FLAG_IMMUTABLE);
@@ -123,6 +153,7 @@ public final class NetworkService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        Bridge.upgrade(this); // An old-protocol network binding turns the LAN listener off until re-enabled.
         if (!shouldRun(this)) {
             stopSelf();
             return START_NOT_STICKY;
@@ -155,7 +186,8 @@ public final class NetworkService extends Service {
             bridge = new Bridge(this);
             key = SigningKey.prepare();
             NetworkIdentity identity = new NetworkIdentity();
-            if (!identity.approved(bridge, key) || bridge.pairings().length() == 0)
+            identityStatement = identity.approved(bridge, key);
+            if (identityStatement == null || bridge.pairings().length() == 0)
                 throw new IllegalStateException("Enable the network connection in Navi first.");
             socketFactory = identity.context().getServerSocketFactory();
         } catch (Exception error) {
@@ -206,31 +238,31 @@ public final class NetworkService extends Service {
             if (stopping) return;
             deadlines.schedule(deadline, 10000);
             connection.startHandshake();
-            byte[] random = new byte[32];
-            new SecureRandom().nextBytes(random);
-            String nonce = Bridge.encode(random);
+            byte[] nonce = new byte[32];
+            new SecureRandom().nextBytes(nonce);
             InputStream input = connection.getInputStream();
             OutputStream output = connection.getOutputStream();
-            send(output, new JSONObject().put("identity", bridge.read("network-identity.json")).put("nonce", nonce));
-            JSONObject envelope = receive(input);
-            byte[] raw = Bridge.decode(envelope.getString("payload_b64"));
-            if (raw.length > 98304) throw new IllegalArgumentException("RPC too large");
-            JSONObject rpc = new JSONObject(new String(raw, StandardCharsets.UTF_8));
-            String machine = rpc.getString("machine_id");
-            if (!machine.matches("[a-f0-9]{64}") || !nonce.equals(rpc.getString("server_nonce"))
-                    || !Challenge.DOMAIN.equals(rpc.getString("domain"))
-                    || !"network-rpc".equals(rpc.getString("kind")) || !key.id.equals(rpc.getString("phone_key_id")))
-                throw new IllegalArgumentException("Invalid network request");
+            send(output, NetworkHello.newBuilder().setIdentity(identityStatement).setNonce(ByteString.copyFrom(nonce)).build());
+            Signed envelope = Wire.parse(Signed::parseFrom, receive(input), LIMIT);
+            // Unverified until the signature check below: machine_id only selects the pinned computer key.
+            NetworkRpc claimed = Wire.peek(envelope.getPayload().toByteArray(), Payload.BodyCase.NETWORK_RPC).getNetworkRpc();
+            String machine = Wire.hex(Wire.exact(claimed.getMachineId(), 32, "computer key ID"));
             JSONObject paired = bridge.pairings().optJSONObject(machine);
             if (paired == null) throw new IllegalArgumentException("Computer is not paired");
-            Bridge.verifyEnvelope(envelope, Bridge.certificate(paired.getString("machine_certificate_b64")));
+            NetworkRpc rpc = Wire.open(envelope, Bridge.certificate(paired.getString("machine_certificate_b64")).getPublicKey(),
+                    Payload.BodyCase.NETWORK_RPC).getNetworkRpc();
+            // Bound to this connection: a recorded call cannot be replayed on another.
+            if (!java.security.MessageDigest.isEqual(nonce, rpc.getServerNonce().toByteArray()))
+                throw new IllegalArgumentException("Invalid network request");
             // Serialize mailbox changes so paired computers cannot replace each other's active request.
-            JSONObject value;
+            Mail value;
             synchronized (mailbox) {
                 if (stopping) throw new IllegalStateException("Network authentication is off");
                 value = exchange(rpc, machine);
             }
-            send(output, new JSONObject().put("ok", true).put("value", value == null ? JSONObject.NULL : value));
+            NetworkReply.Builder reply = NetworkReply.newBuilder().setOk(true);
+            if (value != null) reply.setValue(value);
+            send(output, reply.build());
         } catch (Exception error) {
             // An invalid peer gets no metadata and cannot trigger an Android notification.
             Log.w("PhoneAuthenticator", "LAN request rejected", error);
@@ -241,19 +273,18 @@ public final class NetworkService extends Service {
         }
     }
 
-    private JSONObject exchange(JSONObject rpc, String machine) throws Exception {
-        String operation = rpc.getString("operation");
-        String name = rpc.getString("name");
-        String id = rpc.getString("request_id");
-        if (!id.matches("[a-f0-9]{32}")) throw new IllegalArgumentException("Invalid request ID");
-        if ("write".equals(operation) && "request.json".equals(name)) {
-            JSONObject value = rpc.getJSONObject("value");
-            checkSize(value);
+    private Mail exchange(NetworkRpc rpc, String machine) throws Exception {
+        Op operation = rpc.getOperation();
+        MailName name = rpc.getName();
+        String id = Wire.hex(Wire.exact(rpc.getRequestId(), 16, "request ID"));
+        if (rpc.getValue().getSerializedSize() > Wire.MAX_MESSAGE) throw new IllegalArgumentException("Message too large");
+        if (operation == Op.OP_WRITE && name == MailName.MAIL_REQUEST) {
+            if (rpc.getValue().getValueCase() != Mail.ValueCase.REQUEST) throw new IllegalArgumentException("Expected a request");
+            RequestEnvelope value = rpc.getValue().getRequest();
             Challenge request = bridge.validate(value, key);
-            if (!"authenticate".equals(request.kind) || !id.equals(request.id)
-                    || !machine.equals(request.payload.getString("machine_id")))
+            if (!Challenge.AUTHENTICATE.equals(request.kind) || !id.equals(request.id) || !machine.equals(request.machineId))
                 throw new IllegalArgumentException("Request does not match sender");
-            JSONObject old = bridge.read("request.json");
+            RequestEnvelope old = bridge.readRequest();
             if (old != null) {
                 try {
                     Challenge previous = bridge.validate(old, key);
@@ -261,65 +292,61 @@ public final class NetworkService extends Service {
                         if (!Arrays.equals(previous.bytes, request.bytes)) throw new IllegalArgumentException("Changed request");
                         return null; // Idempotent redelivery cannot repost or clear a completed proof.
                     }
-                    JSONObject response = bridge.read("response.json");
-                    boolean finished = bridge.canceled(previous) || response != null && previous.id.equals(response.optString("request_id"))
-                            && ("declined".equals(response.optString("status")) || bridge.receipt(previous, response));
+                    Response response = bridge.responseFor(previous);
+                    boolean finished = bridge.canceled(previous) || response != null
+                            && (response.getStatus() == in.akuj.fingerprint.wire.Status.STATUS_DECLINED || bridge.receipt(previous, response));
                     if (!finished) throw new IllegalStateException("Another computer request is active");
                 } catch (Challenge.Expired expired) { /* Old request no longer owns the mailbox. */ }
             }
-            bridge.write(name, value);
+            bridge.write(Bridge.REQUEST, value);
             KdeConnectInbox.recordRoute(bridge, id, KdeConnectInbox.ROUTE_LAN);
             RequestReceiver.refreshNotification(this, id, false);
             return null;
         }
-        JSONObject current = bridge.read("request.json");
+        RequestEnvelope current = bridge.readRequest();
         if (current == null) throw new IllegalArgumentException("No current request");
-        boolean terminal = "write".equals(operation) && ("receipt.json".equals(name) || "cancel.json".equals(name));
+        boolean terminal = operation == Op.OP_WRITE && (name == MailName.MAIL_RECEIPT || name == MailName.MAIL_CANCEL);
         Challenge request = bridge.validate(current, key, terminal);
-        if (!id.equals(request.id) || !machine.equals(request.payload.getString("machine_id")))
+        if (!id.equals(request.id) || !machine.equals(request.machineId))
             throw new IllegalArgumentException("Request is owned by another computer");
-        if ("read".equals(operation) && "response.json".equals(name)) {
-            JSONObject response = bridge.read(name);
-            return response != null && id.equals(response.optString("request_id")) ? response : null;
+        if (operation == Op.OP_READ && name == MailName.MAIL_RESPONSE) {
+            Response response = bridge.responseFor(request);
+            return response == null ? null : Mail.newBuilder().setResponse(response).build();
         }
-        if ("write".equals(operation)) {
-            JSONObject value = rpc.getJSONObject("value");
-            checkSize(value);
-            if ("cancel.json".equals(name)) {
-                if (!bridge.canceled(request, value)) throw new IllegalArgumentException("Wrong cancellation");
-            } else if ("receipt.json".equals(name)) {
-                JSONObject response = bridge.read("response.json");
-                if (response == null || !id.equals(response.optString("request_id")) || !bridge.receipt(request, response, value))
+        if (operation == Op.OP_WRITE) {
+            Mail value = rpc.getValue();
+            if (name == MailName.MAIL_CANCEL && value.getValueCase() == Mail.ValueCase.CANCEL) {
+                if (!bridge.canceled(request, value.getCancel())) throw new IllegalArgumentException("Wrong cancellation");
+                bridge.write(Bridge.CANCEL, value.getCancel());
+                RequestReceiver.refreshNotification(this, id, true);
+            } else if (name == MailName.MAIL_RECEIPT && value.getValueCase() == Mail.ValueCase.RECEIPT) {
+                Response response = bridge.responseFor(request);
+                if (response == null || !bridge.receipt(request, response, value.getReceipt()))
                     throw new IllegalArgumentException("Wrong receipt");
+                bridge.write(Bridge.RECEIPT, value.getReceipt());
             } else throw new IllegalArgumentException("Unknown mailbox operation");
-            bridge.write(name, value);
-            if ("cancel.json".equals(name)) RequestReceiver.refreshNotification(this, id, true);
             return null;
         }
         throw new IllegalArgumentException("Unknown network operation");
     }
 
-    private static void checkSize(JSONObject value) {
-        if (value.toString().getBytes(StandardCharsets.UTF_8).length > 65536) throw new IllegalArgumentException("Message too large");
+    /** One length-prefixed frame (4-byte big-endian length, at most LIMIT bytes). */
+    private static byte[] receive(InputStream input) throws Exception {
+        DataInputStream data = new DataInputStream(input);
+        int size = data.readInt();
+        if (size <= 0 || size > LIMIT) throw new IllegalArgumentException("Network message too large");
+        byte[] bytes = new byte[size];
+        data.readFully(bytes);
+        return bytes;
     }
 
-    private static JSONObject receive(InputStream input) throws Exception {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        for (int count = 0; count < LIMIT; count++) {
-            int next = input.read();
-            if (next == -1) throw new java.io.EOFException();
-            if (next == '\n') return new JSONObject(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
-            bytes.write(next);
-        }
-        throw new IllegalArgumentException("Network message too large");
-    }
-
-    private static void send(OutputStream output, JSONObject value) throws Exception {
-        byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
-        if (bytes.length >= LIMIT) throw new IllegalArgumentException("Network message too large");
-        output.write(bytes);
-        output.write('\n');
-        output.flush();
+    private static void send(OutputStream output, MessageLite value) throws Exception {
+        byte[] bytes = value.toByteArray();
+        if (bytes.length == 0 || bytes.length > LIMIT) throw new IllegalArgumentException("Network message too large");
+        DataOutputStream data = new DataOutputStream(output);
+        data.writeInt(bytes.length);
+        data.write(bytes);
+        data.flush();
     }
 
     @Override public void onDestroy() {

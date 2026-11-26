@@ -56,10 +56,12 @@ Running Set Up again replaces the key and topics.
   anything.
 - **End-to-end encryption.** During setup the computer and Navi each create a
   fresh P-256 key pair and exchange public keys: the computer's inside its signed
-  setup request, Navi's signed together with that request by the fingerprint key.
+  setup request, Navi's inside its fingerprint-signed approval of that request.
   Both derive (HKDF-SHA256) one 256-bit message key and two topic names. **The key
-  and the topic names are never transmitted.** Every message is compressed
-  (DEFLATE), then encrypted with AES-256-GCM, bound to its direction and topic.
+  and the topic names are never transmitted.** Every message is a protobuf
+  `RemoteMessage` (see [`proto/navi.proto`](../proto/navi.proto)), encrypted with
+  AES-256-GCM and bound to its direction and topic (`navi-remote/v2`). Remote
+  approvals set up before protocol v2 keep their key and topics.
 - **Separate inbox per direction and per computer.** The computer publishes to
   the phone's inbox topic and reads its own inbox; a phone paired with several
   computers has separate keys and topics for each, on one background connection.
@@ -76,10 +78,20 @@ Running Set Up again replaces the key and topics.
 
 ## Message size
 
-Requests are about 2–3 KB of text, receipts and replies about 1 KB, within ntfy's
-4 KB message limit. Larger messages (an icon, or a very long command) are sent as
-ntfy attachments. ntfy.sh allows this; a self-hosted ntfy needs
-`attachment-cache-dir` configured.
+Messages are protobuf, uncompressed. A typical request is about 580 characters,
+replies, receipts and cancels about 220 (previously about 1.9 KB and 0.9 KB of
+JSON), well within ntfy's 4 KB inline limit. Commands up to about 2,470 characters
+stay inline. Larger messages (an icon, or a longer command) are sent as ntfy
+attachments. ntfy.sh allows this; a self-hosted ntfy needs `attachment-cache-dir`
+configured.
+
+| Typical sudo request (59-character command) | JSON (0.11) | Protobuf (0.12) |
+| --- | ---: | ---: |
+| Request over ntfy (characters) | 1,937 | 579 |
+| Reply over ntfy (characters) | 291 | 222 |
+| Receipt over ntfy (characters) | 891 | 219 |
+| Request as a KDE Connect file (bytes) | 2,622 | 446 |
+| Request on the direct network (bytes) | 3,774 | 584 |
 
 ## Self-hosting ntfy
 

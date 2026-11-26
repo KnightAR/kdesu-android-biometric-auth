@@ -17,11 +17,15 @@ REQUIRED_USE="${PYTHON_REQUIRED_USE}"
 
 RDEPEND="${PYTHON_DEPS}
     dev-python/cryptography[${PYTHON_USEDEP}]
+    dev-python/protobuf[${PYTHON_USEDEP}]
     dev-python/dbus-python[${PYTHON_USEDEP}]
     dev-python/pygobject[${PYTHON_USEDEP}]
     kde-misc/kdeconnect
     sys-auth/polkit
     dev-qt/qttools:6[qdbus]"
+# protoc generates navi_pb2.py (the wire format) from files/proto/navi.proto; the system protoc
+# matches the system dev-python/protobuf runtime.
+BDEPEND="dev-libs/protobuf"
 
 src_unpack() {
     # The reviewed sources are carried in this repository's files/ directory.
@@ -29,7 +33,7 @@ src_unpack() {
 }
 
 src_compile() {
-    emake CC="$(tc-getCC)" authorize
+    emake CC="$(tc-getCC)" authorize navi_pb2.py
 }
 
 src_install() {
@@ -42,12 +46,12 @@ src_install() {
 
 pkg_postinst() {
     elog "Commands up to ${NAVI_AUTH_MAX_COMMAND:-10240} characters are offered for phone approval"
-    elog "(NAVI_AUTH_MAX_COMMAND). Requests carry the command once, so Navi must be"
-    elog "version 0.11.0 or newer."
+    elog "(NAVI_AUTH_MAX_COMMAND). Messages use the protobuf wire format (protocol v2), so Navi"
+    elog "must be version 0.12.0 or newer; existing pairings keep working without re-enrollment."
     # The helper and configurator start /usr/bin/python3 -I; its default must have the modules.
-    if ! /usr/bin/python3 -I -c 'import cryptography, dbus, gi' >/dev/null 2>&1; then
+    if ! /usr/bin/python3 -I -c 'import cryptography, dbus, gi, google.protobuf' >/dev/null 2>&1; then
         ewarn "The default /usr/bin/python3 ($(/usr/bin/python3 -I -c 'import sys; print(sys.version.split()[0])' 2>/dev/null))"
-        ewarn "cannot import cryptography, dbus and gi. Administrator prompts and the settings page"
+        ewarn "cannot import cryptography, dbus, gi and google.protobuf. Administrator prompts and the settings page"
         ewarn "will fail until the default Python (eselect python) is listed in PYTHON_TARGETS"
         ewarn "and navi-auth's dependencies are rebuilt for it."
     fi

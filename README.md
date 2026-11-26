@@ -27,13 +27,14 @@ part of the security boundary.
 
 | Component | Version / purpose |
 | --- | --- |
-| Android application | 0.11.0, API 28+, readable long commands (formatted/exact view, collapse and expand, explicit Reject), desk reader mode, code enrollment (KDE Connect, guided destination setup, Downloads on Android 9–10), Settings and Paired computers screens, remote approvals over ntfy, non-debuggable release |
-| Host CLI and native/Python authority | 0.11.0 with commands up to 10240 characters (build-time `MAX_COMMAND`), an automatic route per request (direct local network, then KDE Connect messages, then ntfy), code enrollment over KDE Connect, device selection by name, remote approvals over ntfy when KDE Connect can't see the phone, and a warning when kdesu is not Navi-enabled |
+| Android application | 0.12.0, API 28+, protobuf wire format (protocol v2), readable long commands (formatted/exact view, collapse and expand, explicit Reject), desk reader mode, code enrollment (KDE Connect, guided destination setup, Downloads on Android 9–10), Settings and Paired computers screens, remote approvals over ntfy, non-debuggable release |
+| Host CLI and native/Python authority | 0.12.0 with the protobuf wire format (`proto/navi.proto`), commands up to 10240 characters (build-time `MAX_COMMAND`), an automatic route per request (direct local network, then KDE Connect messages, then ntfy), code enrollment over KDE Connect, device selection by name, remote approvals over ntfy when KDE Connect can't see the phone, and a warning when kdesu is not Navi-enabled |
 | System Settings page | `kcm_navi_auth` 0.10.0: enroll, status, remote approvals and test (automatic, KDE Connect messages, direct network or ntfy) per KDE Connect device |
 | KDE patch and Gentoo packages | kdesu-gui 6.8.2-r1 against kde-cli-tools 6.8.2 (6.7.2-r3 for Plasma 6.7.2) |
 | Direct Wi-Fi transport | Pinned TLS 1.3; restricted TLS 1.2 on Android 9; TCP 39841 |
 | Optional KDE Connect transport | File sharing on Android 10+, or paired-device IP lookup for direct Wi-Fi |
-| Android CI | Builds debug and release modes with a disposable signing key |
+| Wire format | One schema, [`proto/navi.proto`](proto/navi.proto), for both sides; signatures cover the exact bytes; no compression or dictionary. A typical request is about 450 B over KDE Connect and 580 characters over ntfy (previously 2.6 KB and 1.9 K) |
+| Android CI | Builds debug and release modes with a disposable signing key, and runs the wire-format self-test (`make check`) |
 
 The verified phones are a **Pixel 9 Pro** running Android 16 and a **Nexus 6P**
 running an Android 9 ROM. Android 9/API 28 is the minimum; the Nexus's older stock
@@ -136,10 +137,12 @@ coverage gaps, including physical reboot and deep-Doze delivery.
 
 ## Build and signing
 
-The verified offline Android build uses SDK platform/build-tools 34, JDK 17+,
-plain Java and Android framework APIs. There are no third-party Android runtime
-libraries. Gradle/Android Studio metadata is also included,
-but `build.sh` is the verified route and no Gradle wrapper is bundled.
+The verified Android build uses SDK platform/build-tools 34, JDK 17+, plain Java,
+the Android framework APIs and one runtime library, the Protocol Buffers Java lite
+runtime. `build.sh` downloads that jar and the matching `protoc` once from Maven
+Central into `build/deps/`, checks their pinned SHA-256 and builds offline after
+that. Gradle/Android Studio metadata is also included, but `build.sh` is the
+verified route and no Gradle wrapper is bundled.
 
 A new phone can be enrolled directly on the release build with the pairing code
 (`./build.sh release --new-key` creates the signing key the first time). The ADB
