@@ -18,6 +18,7 @@ import struct
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import ssl
@@ -164,7 +165,8 @@ MODES = {"execute": "MODE_EXECUTE", "notification-only": "MODE_NOTIFICATION_ONLY
 CONTEXT_TEXT = ("application", "action_id", "command", "requesting_user", "target_user", "source", "icon_name",
                 "requester_executable", "tty")
 CONTEXT_FIELDS = set(CONTEXT_TEXT) | {"requesting_uid", "mode", "icon_sha256", "icon_png_base64",
-                                      "desktop_request_id", "requester_pid", "command_hidden"}
+                                      "desktop_request_id", "requester_pid", "command_hidden", "writable_paths"}
+MAX_WRITABLE_PATHS = 16
 
 
 def context_message(context):
@@ -189,6 +191,13 @@ def context_message(context):
         message.requester_pid = context["requester_pid"]
     if context.get("command_hidden"):
         message.command_hidden = True
+    if context.get("writable_paths"):
+        paths = context["writable_paths"]
+        if (not isinstance(paths, list) or len(paths) > MAX_WRITABLE_PATHS
+                or not all(isinstance(path, str) and path.startswith("/") and check_layout_text(path, 4096)
+                           for path in paths)):
+            raise ValueError("Invalid writable input paths.")
+        message.writable_paths.extend(paths)
     return message
 
 
@@ -279,12 +288,17 @@ def frame(data):
 
 
 def atomic_write(path, data):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+    """Replace path with data: a fresh 0600 file (O_EXCL, never a pre-existing name or symlink)."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def certificate(key, issuer, issuer_key, common_name, ca=False):

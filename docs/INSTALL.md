@@ -271,7 +271,7 @@ EOF
 # Optional: a command limit other than 10240 characters (must not exceed Navi's):
 #   echo 'NAVI_AUTH_MAX_COMMAND=4096' > /etc/portage/env/navi-auth.conf
 #   echo 'sys-auth/navi-auth navi-auth.conf' >> /etc/portage/package.env
-ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/sys-auth/navi-auth/navi-auth-0.13.1.ebuild manifest
+ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/sys-auth/navi-auth/navi-auth-0.14.0.ebuild manifest
 ebuild /var/db/repos/kdesu-biometric-source/packaging/repo/kde-misc/navi-auth-kcm/navi-auth-kcm-0.13.0.ebuild manifest
 ebuild /var/db/repos/kdesu-biometric-source/packaging/kde-repo/kde-plasma/kdesu-gui/kdesu-gui-6.8.2-r1.ebuild manifest
 # Keep Plasma upgrades from silently replacing the Navi-patched kdesu with Gentoo's:
@@ -279,7 +279,7 @@ ebuild /var/db/repos/kdesu-biometric-source/packaging/kde-repo/kde-plasma/kdesu-
 install -d -m 0755 /etc/portage/package.mask
 echo 'kde-plasma/kdesu-gui::gentoo' > /etc/portage/package.mask/navi-kdesu
 emerge --pretend --verbose --oneshot \
-  '=sys-auth/navi-auth-0.13.1::navi-auth-local' \
+  '=sys-auth/navi-auth-0.14.0::navi-auth-local' \
   '=kde-misc/navi-auth-kcm-0.13.0::navi-auth-local' \
   '=kde-plasma/kdesu-gui-6.8.2-r1::navi-kde-local'
 ```
@@ -291,7 +291,7 @@ After accepting the exact plan:
 
 ```sh
 emerge --ask=n --oneshot --usepkg=n --getbinpkg=n --autounmask=n \
-  '=sys-auth/navi-auth-0.13.1::navi-auth-local' \
+  '=sys-auth/navi-auth-0.14.0::navi-auth-local' \
   '=kde-misc/navi-auth-kcm-0.13.0::navi-auth-local' \
   '=kde-plasma/kdesu-gui-6.8.2-r1::navi-kde-local'
 ```
@@ -414,25 +414,46 @@ keeps its own route.
    - Other systems: `make && sudo make install ENABLE_SUDO=yes ENABLE_LOGIN=yes`
      (`SUDO_TERMINALS` and `SUDO_TIMEOUT` change sudo's allowed terminals and timeout).
 
-   This installs the helpers and `navi-pam`, but changes no PAM configuration.
+   This installs the helpers (native `sudo-approve`/`login-approve` entry points, no
+   shell wrappers), `navi-pam` and, with sudo, the approval plugin
+   `navi_sudo_approval.so` (built against sudo's `sudo_plugin.h`), but changes no
+   PAM or sudo configuration.
 2. Switch each on in **System Settings → Navi Authenticator** (asks for the
    administrator password), or as root `/usr/libexec/navi-auth/navi-pam enable sudo|sddm|kde`.
    Keep a root shell or a console login (Ctrl+Alt+F2) available the first time. Each adds
-   one marked line above the password rules of `/etc/pam.d/SERVICE`:
+   a marked block above the password rules of `/etc/pam.d/SERVICE`: the stack's own
+   faillock pre-auth rule when it uses faillock (Gentoo's `system-auth` does), then the
+   helper line:
 
    ```
+   auth	requisite	pam_faillock.so preauth
    sudo:      auth	sufficient	pam_exec.so quiet stdout seteuid /usr/libexec/navi-auth/sudo-approve
    sddm, kde: auth	sufficient	pam_exec.so quiet stdout expose_authtok /usr/libexec/navi-auth/login-approve
    ```
 
-   The original is backed up to `/var/lib/navi-auth/pam-SERVICE.backup`, the new
-   file is written atomically and checked, and files without auth rules are refused.
+   For sudo it also adds the approval plugin to `/etc/sudo.conf` (created if missing),
+   so that sudo runs only the exact command the phone approved:
+
+   ```
+   Plugin navi_sudo_approval /usr/libexec/navi-auth/navi_sudo_approval.so
+   ```
+
+   `navi-pam` then runs `sudo -V`; if sudo cannot load the plugin, `sudo.conf` is
+   restored and nothing is switched on. Originals are backed up to
+   `/var/lib/navi-auth/pam-SERVICE.backup` and `sudo.conf.backup`, new files are
+   written atomically and checked, and files without auth rules are refused.
    `navi-pam status` shows every state; `navi-pam disable SERVICE` (or the switch)
-   removes only that line. If a package update replaces a file, System Settings and
-   `host.py authority-status` say so and **Repair** restores it.
+   removes only these lines. If a package update replaces a file, or a block comes
+   from an older version (no faillock rule or plugin line), System Settings and
+   `host.py authority-status` say so and **Repair** restores it. Uninstalling
+   navi-auth removes the plugin line (sudo refuses to start while `sudo.conf` names a
+   missing plugin; if that ever happens, remove the `navi_sudo_approval` line from a
+   root shell).
 3. Test:
    - sudo: in a new Konsole tab run `sudo echo 1`, approve, expect `1`; decline once
-     and check the password prompt appears; `ssh localhost sudo -v` still asks for it.
+     and check the password prompt appears; `ssh localhost sudo -v` still asks for it;
+     `sudo -s` asks for the password (no phone). `sudo -V` (as root) lists the
+     "Navi sudo approval plugin".
    - Lock screen: lock (Meta+L), press Enter on the empty field, approve, and the
      session unlocks. Typing the password still unlocks at once.
    - SDDM: log out, select your account, press Enter on the empty field, approve.
@@ -446,7 +467,8 @@ keeps its own route.
 Phone approval requires the account that is configured for administrator
 prompts (System Settings → **Administrator prompts**). After a phone login,
 KWallet does not open automatically (its PAM module needs the typed password),
-so it asks once. sudo's usual timestamp applies after a sudo approval. To turn
+so it asks once. sudo's usual timestamp applies after a sudo approval, as after
+a typed password (`timestamp_timeout`, per terminal; 5 minutes by default). To turn
 an approval off use its switch or `navi-pam disable SERVICE`; to remove the
 helpers, turn them off first, then rebuild without the USE flags / ENABLE options.
 

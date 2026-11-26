@@ -2,6 +2,7 @@
 """One-dialog phone verifier/executor, connected to kdesu by inherited pipes."""
 import asyncio
 import base64
+import errno
 from contextlib import contextmanager
 import fcntl
 import importlib.util
@@ -11,6 +12,8 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import shlex
+import shutil
 import signal
 import socket
 import sqlite3
@@ -21,10 +24,9 @@ import sys
 import time
 import uuid
 
-# Load only the adjacent installed, root-owned implementation, never PYTHONPATH.
-_spec = importlib.util.spec_from_file_location("phone_crypto", Path(__file__).with_name("host.py"))
-crypto = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(crypto)
+# host.py (signing, verification, wire format, transports), loaded by load_crypto() only after
+# check_implementation() has verified the installed files; never from PYTHONPATH.
+crypto = None
 
 PROTOCOL = "navi-auth-exec/v1"
 STATE = Path("/var/lib/navi-auth")
@@ -65,12 +67,37 @@ def unique_object(pairs):
 
 
 def trusted_file(path, private=False, limit=MAX_MESSAGE):
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & (0o077 if private else 0o022):
-        raise ValueError(f"Unsafe ownership or permissions: {path}")
-    if info.st_size > limit:
-        raise ValueError(f"Oversized {'configuration' if limit == MAX_MESSAGE else 'file'}: {path}")
-    return path.read_bytes()
+    """The bytes of a root-owned regular file, checked and read through one descriptor (no symlinks)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"Unsafe ownership or permissions: {path}") from None
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & (0o077 if private else 0o022):
+            raise ValueError(f"Unsafe ownership or permissions: {path}")
+        chunks, size = [], 0
+        while size <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > limit:
+            raise ValueError(f"Oversized {'configuration' if limit == MAX_MESSAGE else 'file'}: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def trusted_directory(path):
+    """The directory and every parent up to / must be root-owned and writable only by root."""
+    for directory in (path, *path.parents):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f"Authority implementation directory is not protected: {directory}")
 
 
 IMPLEMENTATION = ("rootauth.py", "host.py", "navi_pb2.py", "kdeconnect_transport.py", "ntfy_transport.py")
@@ -81,13 +108,24 @@ OPTIONAL_IMPLEMENTATION = ("sudo_approve.py", "login_approve.py", "pam_common.py
 def check_implementation(directory=None):
     """The installed program files must be root-owned and not writable by others."""
     directory = directory or Path(__file__).resolve().parent
+    trusted_directory(directory)
     optional = tuple(name for name in OPTIONAL_IMPLEMENTATION if (directory / name).exists())
     for name in IMPLEMENTATION + optional:
-        source = directory / name
-        trusted_file(source, limit=MAX_IMPLEMENTATION)
-        info = source.parent.stat()
-        if info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError("Authority implementation directory is not protected")
+        trusted_file(directory / name, limit=MAX_IMPLEMENTATION)
+
+
+def load_crypto(directory=None, verify=True):
+    """host.py from beside this file, after the installed implementation is verified (once)."""
+    global crypto
+    if crypto is None:
+        directory = directory or Path(__file__).resolve().parent
+        if verify:
+            check_implementation(directory)
+        spec = importlib.util.spec_from_file_location("phone_crypto", directory / "host.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        crypto = module
+    return crypto
 
 
 def private_directory(path, mode):
@@ -176,7 +214,82 @@ def validate_start(event, peer_uid, account):
     cwd = plain(event["cwd"], 4096, "working directory")
     if not cwd.startswith("/") or not Path(cwd).is_dir():
         raise ValueError("Working directory must be an existing absolute directory")
+    try:
+        tokens = shlex.split(context["command"])
+    except ValueError:
+        tokens = []  # unbalanced quoting: no warning can be derived (documented heuristic)
+    context["writable_paths"] = writable_inputs(tokens, peer_uid, os.getgrouplist(account.pw_name, account.pw_gid),
+                                                cwd, execution_env["PATH"])
     return context, execution_env, cwd
+
+
+MAX_WRITABLE = 16
+
+
+def user_can_change(path, uid, groups):
+    """Could uid change what path refers to: the file itself, or any directory on the way (where it
+    could replace an entry; a sticky directory protects entries of other owners)? Checked along the
+    path as given (a symlink the user could repoint counts) and as resolved."""
+    def writable(info):
+        if stat.S_ISLNK(info.st_mode):
+            return info.st_uid == uid  # a symlink's mode bits mean nothing; only its owner can change it
+        return info.st_uid == uid or (info.st_mode & 0o020 and info.st_gid in groups) or info.st_mode & 0o002
+
+    def chain(text):
+        if not text.startswith("/"):
+            return False
+        try:
+            parent = os.lstat("/")
+            if writable(parent) and not parent.st_mode & stat.S_ISVTX:
+                return True
+            current = ""
+            parts = [piece for piece in text.split("/") if piece]
+            for position, part in enumerate(parts):
+                current += "/" + part
+                info = os.lstat(current)
+                # The entry itself (the file, or a directory the user owns) …
+                if writable(info) and (position == len(parts) - 1 or info.st_uid == uid):
+                    return True
+                # … or a directory above it that lets the user replace it (sticky protects others' entries).
+                if writable(parent) and not (parent.st_mode & stat.S_ISVTX and info.st_uid != uid):
+                    return True
+                parent = info
+        except OSError:
+            return False
+        return False
+
+    return chain(os.path.abspath(path)) or chain(os.path.realpath(path))
+
+
+def writable_inputs(tokens, uid, groups, cwd, search_path=None):
+    """Paths among a command's program and arguments that the requesting user can change.
+
+    Approving a command approves its text, not the bytes of the scripts or files it uses; these
+    are shown on the phone as a warning. The program is resolved through search_path (no lookup
+    when None); an argument counts when it names an existing file (also as --option=VALUE)."""
+    candidates = []
+    for index, token in enumerate(tokens[:64]):
+        values = [token]
+        if token.startswith("-") and "=" in token:
+            values.append(token.split("=", 1)[1])
+        for value in values:
+            if not value or "\0" in value:
+                continue
+            if index == 0 and "/" not in value:
+                found = shutil.which(value, path=search_path) if search_path else None
+                if found:
+                    candidates.append(found)
+                continue
+            path = value if value.startswith("/") else os.path.join(cwd, value)
+            if os.path.lexists(path):
+                candidates.append(os.path.abspath(path))
+    flagged = []
+    for path in dict.fromkeys(candidates):
+        if len(flagged) == MAX_WRITABLE:
+            break
+        if len(path) <= 4096 and path.isprintable() and user_can_change(path, uid, set(groups)):
+            flagged.append(path)
+    return flagged
 
 
 DESKTOP_ENVIRONMENT = {"DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XAUTHORITY"}
@@ -909,7 +1022,7 @@ def main():
     if os.geteuid() != 0:
         raise ValueError("The installed authority must run as root")
     os.umask(0o077)
-    check_implementation()
+    load_crypto()
     private_directory(STATE, 0o700)
     private_directory(RUNTIME, 0o755)
     if sys.argv[1:] == ["--check"]:

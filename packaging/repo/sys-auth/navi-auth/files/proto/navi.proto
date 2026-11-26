@@ -136,6 +136,9 @@ message Context {
   string requester_executable = 14;
   string tty = 15;               // sudo only: the requesting terminal (/dev/pts/N)
   bool command_hidden = 16;
+  // Files among the program and arguments that the requesting user can change: approving the
+  // command approves its text, not those files' contents (shown on the phone as a warning).
+  repeated string writable_paths = 17;
 }
 
 message EnvVar {

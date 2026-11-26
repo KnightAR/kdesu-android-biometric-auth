@@ -85,10 +85,15 @@ def typed_password(stream=None):
 
 
 def load_rootauth():
+    """rootauth.py, then host.py only after rootauth verified the installed implementation.
+
+    The native entry point (sudo-approve / login-approve) already verified the same files before
+    starting the interpreter; this repeats the check right before host.py runs."""
     spec = importlib.util.spec_from_file_location("navi_rootauth", Path(__file__).resolve().with_name("rootauth.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.AUDIT_STDERR = False  # stderr is the user's terminal here; decisions go to journalctl -t navi-auth
+    module.load_crypto()
     return module
 
 

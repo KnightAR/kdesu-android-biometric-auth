@@ -3,17 +3,10 @@
  * The installed verifier owns policy, biometric verification and exact execution.
  */
 #define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
 #include <grp.h>
-#include <limits.h>
-#include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#include "navi_exec.h"
 
 static int fail(const char *message)
 {
@@ -40,24 +33,13 @@ int main(int argc, char **argv)
         return fail("invalid invoking account");
     if (clearenv() || setgroups(0, NULL) || setresgid(0, 0, 0) || setresuid(0, 0, 0) || chdir("/"))
         return fail("could not establish the protected execution environment");
-    if (close_range(3, UINT_MAX, 0) != 0)
-        return fail("could not close inherited file descriptors");
-    const struct rlimit core = {0, 0};
-    if (setrlimit(RLIMIT_CORE, &core))
-        return fail("could not disable core dumps");
-    sigset_t empty;
-    sigemptyset(&empty);
-    if (sigprocmask(SIG_SETMASK, &empty, NULL))
-        return fail("could not reset the signal mask");
-    struct sigaction action = {.sa_handler = SIG_DFL};
-    sigemptyset(&action.sa_mask);
-    for (int sig = 1; sig < NSIG; ++sig)
-        if (sig != SIGKILL && sig != SIGSTOP)
-            sigaction(sig, &action, NULL);
-    umask(0077);
+    if (navi_reset_process(3))
+        return fail("could not reset inherited descriptors, signals and limits");
+    /* Checked before the interpreter loads any of it (rootauth.py repeats the check). */
+    if (navi_verify_tree(NAVI_LIBEXECDIR))
+        return fail("the installed implementation is not root-owned and protected");
     alarm(180); /* Absolute process lifetime, including shutdown after a lost GUI. */
-    char *const arguments[] = {"/usr/bin/python3", "-I",
-        "/usr/libexec/navi-auth/rootauth.py", "--stdio", uid, NULL};
+    char *const arguments[] = {NAVI_PYTHON, "-I", NAVI_LIBEXECDIR "/rootauth.py", "--stdio", uid, NULL};
     char *const environment[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "LANG=C.UTF-8", NULL};
     execve(arguments[0], arguments, environment);
     return fail("could not start the installed verifier");

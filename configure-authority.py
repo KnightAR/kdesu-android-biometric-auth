@@ -27,10 +27,15 @@ def main():
     if os.geteuid() != 0:
         raise SystemExit("Run the installed configurator as administrator")
     os.umask(0o077)
-    spec = importlib.util.spec_from_file_location("navi_authority", Path(__file__).with_name("rootauth.py"))
+    source = Path(__file__).resolve().with_name("rootauth.py")
+    for path in (source, *source.parents):  # verified before any of it runs
+        info = path.lstat()
+        if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"Unprotected authority file or directory: {path}")
+    spec = importlib.util.spec_from_file_location("navi_authority", source)
     authority = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(authority)
-    crypto = authority.crypto
+    crypto = authority.load_crypto()  # checks the whole installed implementation before host.py runs
     config_path = authority.CONFIG
     destination = authority.STATE
     for path in (destination, config_path.parent):

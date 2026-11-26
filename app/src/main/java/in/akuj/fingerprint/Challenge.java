@@ -51,6 +51,12 @@ final class Challenge {
         validateText(context.getSource(), 64, false);
         validateText(context.getIconName(), 128, true);
         validateText(context.getTty(), 64, true);
+        if (context.getWritablePathsCount() > 16)
+            throw new IllegalArgumentException("Invalid request display metadata.");
+        for (String path : context.getWritablePathsList()) {
+            validateText(path, 4096, false);
+            if (!path.startsWith("/")) throw new IllegalArgumentException("Invalid request display metadata.");
+        }
         if (!context.getIconSha256().isEmpty()) Wire.exact(context.getIconSha256(), 32, "requester icon hash");
         if (!context.hasRequestingUid()) throw new IllegalArgumentException("Invalid requesting account.");
         if (context.getMode() == Mode.UNRECOGNIZED) throw new IllegalArgumentException("Unknown request mode. " + Wire.UPDATE_HINT);
@@ -111,6 +117,12 @@ final class Challenge {
     boolean execution() { return context.getMode() == Mode.MODE_EXECUTE; }
     /** sudo, SDDM or the lock screen: the computer runs nothing; the waiting caller continues. */
     boolean approvalOnly() { return context.getMode() == Mode.MODE_APPROVE; }
+    /** Files the command uses that the requesting user can change, or "" (signed by the computer). */
+    String writableWarning() {
+        if (context.getWritablePathsCount() == 0) return "";
+        return "Runs files you can change (approving the command does not approve their contents):\n"
+                + String.join("\n", context.getWritablePathsList());
+    }
     boolean remoteSetup() { return REMOTE_SETUP.equals(kind); }
     /** Hex SHA-256 of the requester icon, or "" when the request carries none. */
     String iconSha256() { return context.getIconSha256().isEmpty() ? "" : Wire.hex(context.getIconSha256()); }

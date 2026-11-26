@@ -11,7 +11,9 @@
 #   ENABLE_SUDO=yes   sudo in local Konsole/Kitty terminals
 #   ENABLE_LOGIN=yes  the SDDM login screen and the Plasma lock screen
 # Installing them changes no PAM configuration: each is switched on later in System Settings
-# (administrator password) or with `navi-pam enable sudo|sddm|kde` as root.
+# (administrator password) or with `navi-pam enable sudo|sddm|kde` as root. sudo approval also
+# builds navi_sudo_approval.so (needs sudo's sudo_plugin.h), which `navi-pam enable sudo` adds to
+# /etc/sudo.conf so that sudo only runs the exact command approved on the phone.
 
 PREFIX        ?= /usr
 LIBEXECDIR    ?= $(PREFIX)/libexec/navi-auth
@@ -46,10 +48,25 @@ $(error MAX_COMMAND must be a number from 512 to 16384)
 endif
 PAM_APPROVAL := $(if $(filter yes,$(ENABLE_SUDO) $(ENABLE_LOGIN)),yes,no)
 
-all: authorize navi_pb2.py
+NATIVE_DEFS  = -DNAVI_LIBEXECDIR='"$(LIBEXECDIR)"'
+HARDENING    = -Wl,-z,relro,-z,now
+PAM_DEFS     = $(NATIVE_DEFS) -DNAVI_SUDO_TIMEOUT='"$(SUDO_TIMEOUT)"' \
+               -DNAVI_SUDO_TERMINALS='$(subst $(eval) ,$(comma),$(foreach t,$(SUDO_TERMINALS),"$(t)"))'
+comma := ,
+NATIVE = authorize $(if $(filter yes,$(PAM_APPROVAL)),pam-approve) $(if $(filter yes,$(ENABLE_SUDO)),navi_sudo_approval.so)
 
-authorize: authorize.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -fPIE -pie -Wl,-z,relro,-z,now -o $@ $<
+all: $(NATIVE) navi_pb2.py
+
+authorize: authorize.c navi_exec.h
+	$(CC) $(CPPFLAGS) $(NATIVE_DEFS) $(CFLAGS) $(LDFLAGS) -fPIE -pie $(HARDENING) -o $@ $<
+
+# pam_exec entry point, installed as sudo-approve and login-approve (no shell wrapper).
+pam-approve: pam-approve.c navi_exec.h
+	$(CC) $(CPPFLAGS) $(PAM_DEFS) $(CFLAGS) $(LDFLAGS) -fPIE -pie $(HARDENING) -o $@ $<
+
+# sudo approval plugin (sudo.conf): binds a phone approval to the command sudo runs.
+navi_sudo_approval.so: sudo_approval.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -shared -fPIC -fvisibility=hidden $(HARDENING) -o $@ $<
 
 # The wire format. Generated with the system protoc so it matches the system python protobuf.
 navi_pb2.py: proto/navi.proto
@@ -58,7 +75,7 @@ navi_pb2.py: proto/navi.proto
 check: navi_pb2.py
 	$(PYTHON) -I tools/wire_check.py
 
-install: authorize navi_pb2.py
+install: $(NATIVE) navi_pb2.py
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(LIBEXECDIR) $(DESTDIR)$(POLKITDIR)
 	$(INSTALL) -m 0755 $(PYTHON_FILES) $(DESTDIR)$(LIBEXECDIR)/
 	# The configured command limit, set in exactly one line of the installed host.py.
@@ -80,19 +97,14 @@ ifeq ($(PAM_APPROVAL),yes)
 endif
 ifeq ($(ENABLE_SUDO),yes)
 	$(INSTALL) -m 0755 sudo_approve.py $(DESTDIR)$(LIBEXECDIR)/
-	printf '%s\n' '#!/bin/sh' \
-	    '# Optional sudo approval: run by pam_exec from /etc/pam.d/sudo (navi-pam enable sudo).' \
-	    'exec /usr/bin/python3 -I $(LIBEXECDIR)/sudo_approve.py $(foreach t,$(SUDO_TERMINALS),--terminal $(t)) --timeout $(SUDO_TIMEOUT)' \
-	    > $(DESTDIR)$(LIBEXECDIR)/sudo-approve
-	chmod 0755 $(DESTDIR)$(LIBEXECDIR)/sudo-approve
+	# Run by pam_exec from /etc/pam.d/sudo (navi-pam enable sudo).
+	$(INSTALL) -m 0755 pam-approve $(DESTDIR)$(LIBEXECDIR)/sudo-approve
+	$(INSTALL) -m 0644 navi_sudo_approval.so $(DESTDIR)$(LIBEXECDIR)/
 endif
 ifeq ($(ENABLE_LOGIN),yes)
 	$(INSTALL) -m 0755 login_approve.py $(DESTDIR)$(LIBEXECDIR)/
-	printf '%s\n' '#!/bin/sh' \
-	    '# Optional SDDM login / lock screen approval: run by pam_exec (navi-pam enable sddm|kde).' \
-	    'exec /usr/bin/python3 -I $(LIBEXECDIR)/login_approve.py' \
-	    > $(DESTDIR)$(LIBEXECDIR)/login-approve
-	chmod 0755 $(DESTDIR)$(LIBEXECDIR)/login-approve
+	# Run by pam_exec (navi-pam enable sddm|kde).
+	$(INSTALL) -m 0755 pam-approve $(DESTDIR)$(LIBEXECDIR)/login-approve
 endif
 ifeq ($(PAM_APPROVAL),yes)
 	@echo
@@ -103,6 +115,6 @@ ifeq ($(PAM_APPROVAL),yes)
 endif
 
 clean:
-	rm -f authorize navi_pb2.py
+	rm -f authorize pam-approve navi_sudo_approval.so navi_pb2.py
 
 .PHONY: all install check clean

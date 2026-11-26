@@ -378,6 +378,9 @@ public final class MainActivity extends Activity {
                 findViewById(R.id.command_label).setVisibility(command.isEmpty() ? View.GONE : View.VISIBLE);
                 findViewById(R.id.request_context).setVisibility(View.VISIBLE);
                 findViewById(R.id.preview_notice).setVisibility(request.notificationOnly() ? View.VISIBLE : View.GONE);
+                TextView writable = findViewById(R.id.writable_notice);
+                writable.setText(request.writableWarning());
+                writable.setVisibility(request.writableWarning().isEmpty() ? View.GONE : View.VISIBLE);
                 challenge.setText("REQUEST\n" + request.id + "\nComputer key: "
                         + request.machineId + "\nAction: " + request.context.getActionId()
                         + "\nRequest source: " + request.context.getSource()
@@ -582,6 +585,7 @@ public final class MainActivity extends Activity {
                             : attempt.request.remoteSetup() ? "Allow remote approvals" : "Approve authentication")
                     .setSubtitle(attempt.request.context.getApplication() + " · " + attempt.request.machineName)
                     .setDescription((attempt.request.notificationOnly() ? "Verification preview. Desktop authentication is separate.\n" : "")
+                            + (attempt.request.writableWarning().isEmpty() ? "" : "⚠ Runs files you can change\n")
                             + attempt.request.operation + "\nAccount: " + attempt.request.context.getTargetUser()
                             + promptCommand(attempt.request.context.getCommand()))
                     // Leaving the prompt never rejects: it returns to the request, where Reject is explicit.

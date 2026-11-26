@@ -149,11 +149,38 @@ requests additionally bind `execution` (`"shell": "/bin/sh -c"`, target credenti
 held working-directory inode, restricted environment) and the desktop dialog ID.
 sudo, SDDM and lock-screen requests are `MODE_APPROVE` and carry no `execution`:
 the authority runs nothing, and the receipt's `execution_pid` stays 0.
+`context.writable_paths` lists files among the program and arguments that the
+requesting user can change, computed on the root side (never taken from the
+caller); Navi shows them as a warning.
+
 The command itself is carried once, as the signed `context.command`: it is what Navi
 shows and exactly what the authority runs with `/bin/sh -c`. Navi and the computer
 must both speak protocol v2; a peer on the old JSON format fails closed.
 Approval and commit share a 120-second deadline. SQLite consumes each pending
 proof once. A certificate by itself is not a reusable authentication token.
+
+sudo approval has two steps inside the sudo process:
+
+```mermaid
+sequenceDiagram
+    participant S as sudo
+    participant P as pam_exec → sudo-approve (native) → sudo_approve.py (root)
+    participant N as Navi
+    participant A as navi_sudo_approval.so
+    S->>P: PAM auth (before the policy resolves the command)
+    P->>N: MODE_APPROVE request: argv as typed, tty, warnings
+    N-->>P: biometric Approval of those exact bytes
+    P->>P: record /run/navi-auth/sudo/PID.START (argv bytes, run-as uid, resolved path)
+    P-->>S: PAM success
+    S->>A: check(resolved command, run_argv, runas)
+    A->>A: consume record; require same args, user and program
+    A-->>S: allow, or refuse ("use your password")
+```
+
+Without a record (password or sudo's timestamp) the plugin allows. Native entry
+points (`authorize`, `sudo-approve`, `login-approve`) verify the installed
+implementation before starting Python, and the PAM entry point keeps only the
+checked `PAM_*` items from the PAM environment.
 
 Direct LAN uses TLS 1.3 on Android 10+. Android 9 uses TLS 1.2 with only
 ECDHE-ECDSA/AES-GCM suites; the host accepts both. Before sending command metadata,

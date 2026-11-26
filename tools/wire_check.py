@@ -112,13 +112,16 @@ _, enroll_envelope = host.request_envelope(machine_key, enroll, root, leaf_der)
 # sudo, SDDM and the lock screen: approve-only, nothing for the computer to run.
 approve_context = dict(context, application="sudo in Konsole", action_id="sudo", source="sudo", mode="approve",
                        command="emerge --ask --update @world", desktop_request_id="", requester_executable="",
-                       tty="/dev/pts/31")
+                       tty="/dev/pts/31", writable_paths=["/home/alice/tool.py"])
 approve_only = host.request_message(pb.KIND_AUTHENTICATE, secrets.token_bytes(16), machine_id, leaf_der,
                                     "Run as root with sudo", now, now + 120000, approve_context)
 _, opened_approve = host.open_signed(host.request_envelope(machine_key, approve_only)[1].signed, root.public_key(), "request")
 check("an approve-only request is MODE_APPROVE without an execution",
       opened_approve.context.mode == pb.MODE_APPROVE and not opened_approve.HasField("execution"))
 check("the sudo terminal round-trips", opened_approve.context.tty == "/dev/pts/31")
+check("writable input paths round-trip", list(opened_approve.context.writable_paths) == ["/home/alice/tool.py"])
+refused("a relative writable path", lambda: host.context_message(dict(approve_context, writable_paths=["tool.py"])))
+refused("too many writable paths", lambda: host.context_message(dict(approve_context, writable_paths=["/x"] * 17)))
 refused("a terminal that is not a pseudo-terminal", lambda: host.context_message(dict(approve_context, tty="/dev/tty1")))
 refused("an unknown request mode", lambda: host.context_message(dict(context, mode="sudo")))
 check("enrollment carries both certificates",

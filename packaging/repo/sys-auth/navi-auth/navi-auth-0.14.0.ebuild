@@ -28,6 +28,8 @@ RDEPEND="${PYTHON_DEPS}
 # protoc generates navi_pb2.py (the wire format) from files/proto/navi.proto; the system protoc
 # matches the system dev-python/protobuf runtime.
 BDEPEND="dev-libs/protobuf"
+# sudo_plugin.h for the approval plugin (navi_sudo_approval.so)
+DEPEND="sudo? ( app-admin/sudo )"
 
 src_unpack() {
     # The reviewed sources are carried in this repository's files/ directory.
@@ -35,7 +37,8 @@ src_unpack() {
 }
 
 src_compile() {
-    emake CC="$(tc-getCC)" authorize navi_pb2.py
+    # authorize, the pam_exec entry point (USE=sudo/login) and the sudo approval plugin (USE=sudo)
+    emake CC="$(tc-getCC)" ENABLE_SUDO=$(usex sudo yes no) ENABLE_LOGIN=$(usex login yes no) all
 }
 
 src_install() {
@@ -67,8 +70,20 @@ pkg_postinst() {
         use sudo && elog "  sudo: sudo in local Konsole/Kitty terminals (/etc/pam.d/sudo)"
         use login && elog "  sddm: the SDDM login screen; kde: the Plasma lock screen (Enter with an empty"
         use login && elog "        password asks the phone; typing the password works as before)"
-        elog "Each adds one line to /etc/pam.d/SERVICE; 'navi-pam disable SERVICE' removes it."
+        elog "Each adds a marked block to /etc/pam.d/SERVICE (with the stack's faillock check);"
+        use sudo && elog "sudo also adds the Navi approval plugin to /etc/sudo.conf, so sudo runs only the"
+        use sudo && elog "exact command approved on the phone. 'navi-pam disable SERVICE' removes it all."
+        elog "Already enabled from an earlier version? Run 'navi-pam status': a service shown as"
+        elog "outdated needs Repair in System Settings (or 'navi-pam enable SERVICE' as root)."
         elog "Console logins, SSH, su, pkexec and polkit prompts keep using passwords."
         use login && elog "The SDDM login needs Remote Approvals (ntfy): KDE Connect only runs after login."
+    fi
+}
+
+pkg_prerm() {
+    # On removal (not upgrade), take the plugin out of /etc/sudo.conf: sudo refuses to start while
+    # sudo.conf names a plugin that is no longer installed. The PAM lines fall back to the password.
+    if [[ -z ${REPLACED_BY_VERSION} ]] && use sudo && [[ -x "${EROOT}"/usr/libexec/navi-auth/navi-pam ]]; then
+        "${EROOT}"/usr/libexec/navi-auth/navi-pam disable sudo || ewarn "Remove the navi_sudo_approval line from /etc/sudo.conf"
     fi
 }

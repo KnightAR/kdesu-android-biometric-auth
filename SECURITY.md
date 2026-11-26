@@ -64,7 +64,24 @@ boundary preventing direct helper invocation.
 - **Mutable command inputs:** signing `/path/script` does not freeze that script,
   executable, imports or data. Use the same verified byte buffer or a protected
   immutable snapshot. A digest check followed by reopening a writable pathname
-  leaves a replacement race.
+  leaves a replacement race. As a warning, not a fix: the root side checks the
+  program (resolved through the execution `PATH`) and every argument naming an
+  existing file, and signs those the requesting user can change (the file, a
+  directory the user owns or can write on the way, or a symlink the user could
+  repoint) into the request; Navi shows them prominently ("Runs files you can
+  change"). For kdesu the command is split with shell quoting rules as a
+  best-effort heuristic (expansions, redirections and files opened indirectly are
+  not seen). The approval still covers the text, not those files' contents.
+- **Root trusted computing base:** the root side is Python (`rootauth.py`,
+  `host.py`, protobuf, `cryptography`), and the direct-network TLS client and
+  ntfy decryption run in the root process (KDE Connect D-Bus and ntfy HTTP run in
+  workers dropped to the user). The native entry points (`authorize`,
+  `sudo-approve`, `login-approve`) verify that every installed implementation
+  file and its directories up to `/` are root-owned and not group/other-writable
+  before the interpreter starts, and `rootauth.py` repeats the check before it
+  loads `host.py`. The planned next step is a small native broker for keys,
+  verification, single-use state and execution, with all phone transport in an
+  unprivileged process.
 - **Development machine key:** configuring root authority copies the machine
   key from user state. A retained user copy means a machine signature alone does
   not prove root-broker origin. Protected execution records are separate evidence.
@@ -108,12 +125,39 @@ boundary preventing direct helper invocation.
 - **Optional sudo, login and lock-screen approval:** built only with
   `USE=sudo` / `USE=login` (`ENABLE_SUDO` / `ENABLE_LOGIN`) and active only after
   an administrator switches each on (`navi-pam`, polkit `auth_admin`), which adds
-  one `pam_exec` line to `/etc/pam.d/sudo`, `sddm` or `kde`.
+  a marked block to `/etc/pam.d/sudo`, `sddm` or `kde`: the stack's own
+  `pam_faillock.so preauth` rule (when the stack uses faillock, so a locked account
+  is not offered the phone), then one `pam_exec` line. pam_exec starts a small
+  native entry point, not a shell: it keeps only the checked `PAM_SERVICE`,
+  `PAM_TYPE`, `PAM_USER`, `PAM_RUSER`, `PAM_RHOST` and `PAM_TTY` values from the
+  PAM environment (which a user can partly influence), resets descriptors,
+  signals and limits, verifies the installed implementation and runs a fixed
+  `python3 -I` command.
   - sudo: the helper runs as root inside sudo and offers the phone only for
-    `PAM_SERVICE=sudo` on a pseudo-terminal whose process ancestry contains Konsole
-    or Kitty owned by the user and no `sshd`. The command shown is sudo's own
-    argument list, a display hint: sudo still applies sudoers, aliases and `-s`/`-i`.
-    The phone also shows the requesting terminal (`/dev/pts/N`).
+    `PAM_SERVICE=sudo`, started by the root-owned setuid `/usr/bin/sudo`, on a
+    pseudo-terminal whose process ancestry contains Konsole or Kitty owned by the
+    user and no `sshd`, and only for a plain `sudo [options] [VAR=value] command`:
+    `-s`, `-i`, `-e`/sudoedit, `-l`, `-v`, `-b`, `-g`, `-D`, `-R` and `-h` are left
+    to the password. The phone shows sudo's argument list and the requesting
+    terminal (`/dev/pts/N`).
+  - sudo binding: PAM authenticates before sudo's policy has resolved the
+    command, so the phone approves the command as typed. After a phone approval
+    the helper leaves a root-only record (`/run/navi-auth/sudo/PID.START`: the
+    exact argument bytes, the run-as uid and, for a program given as a path, the
+    file it resolves to; valid 120 s). `navi-pam enable sudo` also adds the Navi
+    approval plugin to `/etc/sudo.conf`; sudo calls it with the policy-resolved
+    command, and it consumes the record and refuses unless the arguments are
+    byte-identical, the run-as user matches and the program is the approved file
+    (or, for a bare name, that name found somewhere the user cannot change). When
+    sudo was authenticated by the password or its timestamp there is no record and
+    the plugin allows, like plain sudo; it never allows what sudo's policy refused.
+    The plugin does not compare the environment sudoers builds or the working
+    directory. If sudo cannot load it, `navi-pam` restores `sudo.conf`; removing
+    the package removes the line.
+  - sudo timestamp: a phone approval authenticates like a typed password, so
+    sudo's normal credential cache applies (`timestamp_timeout`, per terminal by
+    default; 5 minutes unless configured): later sudos in that terminal within
+    the timeout run without asking again.
   - SDDM: offered only for `PAM_SERVICE=sddm` from root-owned `sddm-helper`
     started by `sddm`, and only when the password field is empty; a typed password
     goes straight to the normal check.
@@ -127,17 +171,20 @@ boundary preventing direct helper invocation.
   - These checks limit *where* the phone is offered; they are not a boundary
     against code already running as the user. Anyone at the keyboard can trigger a
     request; the fingerprint approval is the gate, and every failure falls back to
-    the password. The `sufficient` line sits before the password rules, so
-    `pam_faillock`'s auth-time lockout does not apply to phone approvals (account
-    checks such as `pam_nologin` still do). Approval is recorded without execution.
+    the password. A phone approval returns `sufficient` before the password rules:
+    faillock's pre-auth lockout is checked first (see above), but other auth-stage
+    modules after the block do not run for it (account checks such as `pam_nologin`
+    still do). Approval is recorded without execution.
 - **Biometric modality:** Android selects strength, not exclusively fingerprint.
   Locally observed hardware enforcement is not independently verified attestation.
 - **Availability:** the LAN service adds network-facing code. Frames, workers and
   transaction times are bounded, but hostile-traffic availability has not been
   established. Reboot/deep-Doze behavior and battery cost require device testing.
-- **Scope:** only the configured local UID and root target are supported. There
-  is no PAM/sudo/login/lock-screen integration or automatic system-wide PolicyKit
-  replacement. Password fallback is available before phone commit.
+- **Scope:** only the configured local UID is supported; kdesu execution targets
+  root only. sudo, the SDDM login and the Plasma lock screen are optional and off
+  by default (above); there is no automatic system-wide PolicyKit replacement, and
+  console logins, SSH, su, pkexec and polkit prompts keep using passwords.
+  Password fallback is available before phone commit.
 
 ## Failure handling
 
